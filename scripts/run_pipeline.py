@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VESTA Pipeline Runner
+VESTA Pipeline Runner — Scene Graph Edition
 
-Step 1: Process a video → detect hazards → build registry → save results.
+Step 1: Process a video → extract scene graph → save results.
 Step 2: Ask questions interactively OR use scripts/ask.py for single questions.
 
 Usage:
@@ -16,9 +16,9 @@ Usage:
     python scripts/run_pipeline.py --video data/test_videos/test.mp4 --no-interactive
 
 Output files (saved to results/):
-    results/<video>_annotated.mp4   ← Video with hazard overlays + radar minimap
-    results/<video>_results.json    ← Full hazard registry as JSON
-    results/<video>_registry.pkl    ← Saved agent state (for scripts/ask.py)
+    results/<video>_annotated.mp4   ← Video with entity overlays + radar minimap
+    results/<video>_results.json    ← Full scene graph as JSON
+    results/<video>_graph.pkl       ← Saved agent state (for scripts/ask.py)
 """
 
 import argparse
@@ -33,12 +33,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from vesta.agent.vesta_agent import VestaAgent
+from vesta.agent.scene_agent import SceneAgent
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VESTA — Process a construction site video and detect hazards"
+        description="VESTA — Process video and build spatio-temporal scene graph"
     )
     parser.add_argument("--video", required=True, help="Path to video file (.mp4)")
     parser.add_argument("--max-frames", type=int, default=None,
@@ -60,47 +60,47 @@ def main():
 
     output_video = args.output_video or str(output_dir / f"{video_name}_annotated.mp4")
     results_json = output_dir / f"{video_name}_results.json"
-    registry_pkl = output_dir / f"{video_name}_registry.pkl"
+    graph_pkl = output_dir / f"{video_name}_graph.pkl"
 
     # ── STEP 1: Process the video ───────────────────────────────────────
-    agent = VestaAgent(
+    agent = SceneAgent(
         video_path=args.video,
         keyframe_interval=args.keyframe_interval,
         model=args.model,
     )
 
     print("=" * 60)
-    print("  VESTA — Vision-Enhanced Spatial Tracking Agent")
+    print("  VESTA — Spatio-Temporal Scene Graph")
     print("=" * 60)
 
     summary = agent.process(max_frames=args.max_frames, output_video=output_video)
 
     # Print summary
     print("\n" + "=" * 60)
-    print("  HAZARD REGISTRY SUMMARY")
+    print("  SCENE GRAPH SUMMARY")
     print("=" * 60)
     print(f"  Frames processed:    {summary['frames_processed']}")
     print(f"  Keyframes analyzed:  {summary['keyframes_analyzed']}")
-    print(f"  Total detections:    {summary['total_detections']}")
-    print(f"  Unique hazards:      {summary['total_hazards']}")
+    print(f"  Total entities:      {summary['total_entities']}")
+    print(f"  Total relationships: {summary['total_relationships']}")
     print(f"  Current heading:     {summary['current_heading']}°")
-    print(f"  By severity:")
-    for sev, count in summary['by_severity'].items():
+    print(f"  By category:")
+    for cat, count in summary.get('by_category', {}).items():
         if count > 0:
-            print(f"    {sev}: {count}")
+            print(f"    {cat}: {count}")
 
-    if summary['hazards']:
-        print(f"\n  Hazards:")
-        for h in summary['hazards']:
-            print(f"    [{h['severity'].upper():8s}] {h['label']} @ {h['angle']}° (conf: {h['confidence']})")
+    if summary.get('entities'):
+        print(f"\n  Entities:")
+        for e in summary['entities']:
+            print(f"    [{e['category']:10s}] {e['label']} @ {e['angle']}° (conf: {e['confidence']})")
 
     # ── Save outputs ────────────────────────────────────────────────────
     with open(results_json, "w") as f:
         json.dump(summary, f, indent=2)
 
-    with open(registry_pkl, "wb") as f:
+    with open(graph_pkl, "wb") as f:
         pickle.dump({
-            "registry": agent.registry,
+            "graph": agent.graph,
             "frame_count": agent.frame_count,
             "fps": agent.fps,
             "model": agent.model,
@@ -114,17 +114,17 @@ def main():
     try:
         from vesta.utils.spatial_map import (
             compute_camera_path,
-            project_hazards_to_world,
+            project_entities_to_world,
             build_3d_map,
             build_2d_radar_map,
         )
 
         print("\n[VESTA] Generating spatial maps...")
         camera_path = compute_camera_path(agent.motions, fps=agent.fps)
-        hazard_positions = project_hazards_to_world(agent.registry, camera_path)
+        entity_positions = project_entities_to_world(agent.graph, camera_path)
 
-        build_3d_map(camera_path, hazard_positions, output_path=map_3d_path)
-        build_2d_radar_map(camera_path, hazard_positions, output_path=map_2d_path)
+        build_3d_map(camera_path, entity_positions, output_path=map_3d_path)
+        build_2d_radar_map(camera_path, entity_positions, output_path=map_2d_path)
     except Exception as e:
         print(f"[VESTA] Warning: Could not generate spatial maps: {e}")
         map_3d_path = "(skipped)"
@@ -133,7 +133,7 @@ def main():
     print(f"\n  Output files:")
     print(f"    Video:    {output_video}")
     print(f"    JSON:     {results_json}")
-    print(f"    Registry: {registry_pkl}  (use with scripts/ask.py)")
+    print(f"    Graph:    {graph_pkl}  (use with scripts/ask.py)")
     print(f"    3D Map:   {map_3d_path}")
     print(f"    2D Map:   {map_2d_path}")
 
@@ -144,11 +144,11 @@ def main():
     _interactive_loop(agent)
 
 
-def _interactive_loop(agent: VestaAgent):
+def _interactive_loop(agent: SceneAgent):
     """Run the interactive question-answer loop."""
     print("\n" + "=" * 60)
-    print("  INTERACTIVE MODE — Ask VESTA about hazards")
-    print("  Commands: 'map' (full registry), 'quit' (exit)")
+    print("  INTERACTIVE MODE — Ask VESTA about the scene")
+    print("  Commands: 'map' (all entities), 'quit' (exit)")
     print("=" * 60)
 
     while True:
@@ -163,8 +163,8 @@ def _interactive_loop(agent: VestaAgent):
             break
         if question.lower() == "map":
             print()
-            for h in agent.registry.get_all():
-                print(f"  {agent.registry.describe_relative_to_camera(h)}")
+            for e in agent.graph.get_all():
+                print(f"  {agent.graph.describe_relative_to_camera(e)}")
             continue
 
         print()

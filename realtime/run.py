@@ -35,6 +35,8 @@ def main():
                         help="Max background Gemini workers (default: 2)")
     parser.add_argument("--no-audio", action="store_true",
                         help="Disable spoken audio alerts")
+    parser.add_argument("--viz", action="store_true",
+                        help="Launch live 3D web visualization (localhost:8080)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress verbose output")
     args = parser.parse_args()
@@ -51,11 +53,14 @@ def main():
         keyframe_interval=args.keyframe_interval,
         max_workers=args.workers,
         audio_alerts=not args.no_audio,
+        enable_viz=args.viz,
         verbose=not args.quiet,
     )
 
     print("[VESTA RT] Starting real-time pipeline...")
     print("[VESTA RT] Controls: Q=quit, SPACE=pause, S=screenshot")
+    if args.viz:
+        print("[VESTA RT] 3D visualization: http://localhost:8080")
     print()
 
     pipeline.run(source=source)

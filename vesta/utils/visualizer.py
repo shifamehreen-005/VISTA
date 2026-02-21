@@ -1,11 +1,11 @@
 """
-Video Visualizer — Annotated output with hazard overlays and radar minimap.
+Video Visualizer — Annotated output with entity overlays and radar minimap.
 
 Renders:
-1. Bounding markers on detected hazards in the current frame
-2. A radar minimap showing all hazards in the registry (360° view)
-3. Heading indicator and severity-colored hazard dots
-4. Status bar with frame count, heading, and hazard count
+1. Bounding markers on detected entities in the current frame
+2. A radar minimap showing all entities in the scene graph (360° view)
+3. Heading indicator and category-colored entity dots
+4. Status bar with frame count, heading, and entity count
 """
 
 import math
@@ -14,14 +14,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from vesta.registry.hazard_registry import HazardRegistry, HazardEntry
+from vesta.registry.scene_graph import SceneGraph, Entity
 
 # ── Color scheme ────────────────────────────────────────────────────────────
-SEVERITY_COLORS = {
-    "critical": (0, 0, 255),      # Red
-    "high":     (0, 100, 255),    # Orange
-    "medium":   (0, 200, 255),    # Yellow
-    "low":      (0, 255, 0),      # Green
+CATEGORY_COLORS = {
+    "person":    (255, 100, 50),    # Blue
+    "equipment": (0, 200, 255),     # Yellow
+    "structure": (150, 150, 150),   # Gray
+    "material":  (0, 200, 0),       # Green
+    "vehicle":   (0, 140, 255),     # Orange
+    "signage":   (200, 200, 0),     # Cyan
+    "unknown":   (180, 180, 180),   # Light gray
 }
 WHITE = (255, 255, 255)
 GRAY = (120, 120, 120)
@@ -32,7 +35,7 @@ HEADING_COLOR = (255, 200, 0)  # Cyan-ish
 
 
 class VideoVisualizer:
-    """Renders annotated video frames with hazard overlays and radar."""
+    """Renders annotated video frames with entity overlays and radar."""
 
     def __init__(
         self,
@@ -53,7 +56,7 @@ class VideoVisualizer:
     def annotate_frame(
         self,
         frame: np.ndarray,
-        registry: HazardRegistry,
+        graph: SceneGraph,
         current_detections: list | None = None,
         frame_idx: int = 0,
         fps: float = 30.0,
@@ -64,8 +67,8 @@ class VideoVisualizer:
 
         Args:
             frame: Original BGR frame
-            registry: Current hazard registry state
-            current_detections: Hazards detected in THIS frame (if keyframe)
+            graph: Current scene graph state
+            current_detections: Entities detected in THIS frame (if keyframe)
             frame_idx: Current frame number
             fps: Video FPS for timestamp display
         """
@@ -80,22 +83,23 @@ class VideoVisualizer:
             self.radar_margin + self.radar_size // 2,
         )
 
-        # 1. Draw detection markers on current-frame hazards
+        # 1. Draw detection markers on current-frame entities
         if current_detections:
             self._draw_detections(out, current_detections, w, h)
 
         # 2. Draw the radar minimap
-        self._draw_radar(out, registry)
+        self._draw_radar(out, graph)
 
         # 3. Draw status bar
-        self._draw_status_bar(out, registry, frame_idx, fps, is_keyframe)
+        self._draw_status_bar(out, graph, frame_idx, fps, is_keyframe)
 
         return out
 
     def _draw_detections(self, frame, detections, w, h):
-        """Draw bounding boxes on hazards detected in the current frame."""
+        """Draw bounding boxes on entities detected in the current frame."""
         for det in detections:
-            color = SEVERITY_COLORS.get(det.severity, WHITE)
+            category = getattr(det, "category", "unknown")
+            color = CATEGORY_COLORS.get(category, WHITE)
 
             # Use bounding box if available, fall back to center point
             has_bbox = hasattr(det, "x1") and det.x1 != 0 and det.x2 != 0
@@ -152,8 +156,8 @@ class VideoVisualizer:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA,
             )
 
-    def _draw_radar(self, frame, registry: HazardRegistry):
-        """Draw a top-down radar minimap showing all hazards in the registry."""
+    def _draw_radar(self, frame, graph: SceneGraph):
+        """Draw a top-down radar minimap showing all entities in the scene graph."""
         cx, cy = self.radar_center
         r = self.radar_size // 2
 
@@ -171,7 +175,7 @@ class VideoVisualizer:
         cv2.line(frame, (cx - r, cy), (cx + r, cy), RADAR_RING, 1)
 
         # Camera heading indicator (FOV cone)
-        heading = registry.current_heading
+        heading = graph.current_heading
         fov_half = 45  # degrees
 
         # Draw FOV cone
@@ -201,23 +205,21 @@ class VideoVisualizer:
         arrow_y = int(cy - arrow_len * math.sin(head_angle))
         cv2.arrowedLine(frame, (cx, cy), (arrow_x, arrow_y), HEADING_COLOR, 2, tipLength=0.4)
 
-        # Plot hazards as colored dots
-        all_hazards = registry.get_all(min_confidence=0.3)
-        for hazard in all_hazards:
-            color = SEVERITY_COLORS.get(hazard.severity, WHITE)
+        # Plot entities as colored dots
+        all_entities = graph.get_all(min_confidence=0.3)
+        for entity in all_entities:
+            color = CATEGORY_COLORS.get(entity.category, WHITE)
 
             # Convert allocentric angle to radar position
-            # Angle 0 = up (initial heading direction)
-            angle_rad = math.radians(-hazard.allo_angle + 90)
-            # Distance maps to radar radius (closer = farther from center)
-            dist_ratio = min(1.0, (1.0 - hazard.distance) * 0.8 + 0.2)
+            angle_rad = math.radians(-entity.allo_angle + 90)
+            dist_ratio = min(1.0, (1.0 - entity.distance) * 0.8 + 0.2)
             dot_r = int(dist_ratio * (r - 10))
 
             dot_x = int(cx + dot_r * math.cos(angle_rad))
             dot_y = int(cy - dot_r * math.sin(angle_rad))
 
             # Dot size based on confidence
-            dot_size = max(3, int(hazard.confidence * 6))
+            dot_size = max(3, int(entity.confidence * 6))
             cv2.circle(frame, (dot_x, dot_y), dot_size, color, -1)
             cv2.circle(frame, (dot_x, dot_y), dot_size, WHITE, 1)
 
@@ -226,7 +228,7 @@ class VideoVisualizer:
         cv2.putText(frame, f"{heading:.0f}", (cx - 15, cy + r + 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, HEADING_COLOR, 1)
 
-    def _draw_status_bar(self, frame, registry: HazardRegistry, frame_idx: int,
+    def _draw_status_bar(self, frame, graph: SceneGraph, frame_idx: int,
                          fps: float, is_keyframe: bool):
         """Draw status bar at the bottom of the frame."""
         h, w = frame.shape[:2]
@@ -238,40 +240,30 @@ class VideoVisualizer:
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
         timestamp = frame_idx / fps
-        summary = registry.get_summary()
+        summary = graph.get_summary()
         y = h - 12
 
         # Left: timestamp and frame
         cv2.putText(frame, f"T={timestamp:.1f}s  Frame {frame_idx}",
                     (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1, cv2.LINE_AA)
 
-        # Center: hazard counts by severity
-        counts = summary["by_severity"]
+        # Center: entity counts by category
+        by_cat = summary.get("by_category", {})
         x_pos = w // 3
-        for sev in ["critical", "high", "medium", "low"]:
-            count = counts.get(sev, 0)
+        for cat in ["person", "equipment", "structure", "material", "vehicle"]:
+            count = by_cat.get(cat, 0)
             if count > 0:
-                color = SEVERITY_COLORS[sev]
-                text = f"{sev[0].upper()}:{count}"
+                color = CATEGORY_COLORS.get(cat, WHITE)
+                text = f"{cat[:3].upper()}:{count}"
                 cv2.putText(frame, text, (x_pos, y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-                x_pos += 70
+                x_pos += 80
 
         # Right: heading + keyframe indicator
-        heading_text = f"HDG {registry.current_heading:.1f}"
+        heading_text = f"HDG {graph.current_heading:.1f}"
         cv2.putText(frame, heading_text, (w - 150, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, HEADING_COLOR, 1, cv2.LINE_AA)
 
         if is_keyframe:
             cv2.circle(frame, (w - 20, y - 5), 8, (0, 0, 255), -1)
             cv2.putText(frame, "AI", (w - 27, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, WHITE, 1)
-
-    def _draw_legend(self, frame):
-        """Draw severity legend."""
-        h = frame.shape[0]
-        x, y = 10, h - 55
-        for sev, color in SEVERITY_COLORS.items():
-            cv2.circle(frame, (x + 6, y), 5, color, -1)
-            cv2.putText(frame, sev.capitalize(), (x + 16, y + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, WHITE, 1)
-            x += 90

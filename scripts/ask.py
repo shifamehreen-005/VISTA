@@ -2,20 +2,20 @@
 """
 Ask VESTA — Query a previously processed video without re-processing.
 
-This loads the saved registry from a prior run of run_pipeline.py and lets you
+This loads the saved scene graph from a prior run of run_pipeline.py and lets you
 ask questions immediately (no video processing, no waiting).
 
 Usage:
-    # Interactive mode (loads saved registry)
-    python scripts/ask.py --registry results/test_registry.pkl
+    # Interactive mode (loads saved graph)
+    python scripts/ask.py --graph results/test_graph.pkl
 
     # Single question (no interactive prompt)
-    python scripts/ask.py --registry results/test_registry.pkl --question "What's behind me?"
+    python scripts/ask.py --graph results/test_graph.pkl --question "What's behind me?"
 
     # Multiple questions from command line
-    python scripts/ask.py --registry results/test_registry.pkl \
-        --question "What's the most dangerous hazard?" \
-        --question "Any fall risks to my left?"
+    python scripts/ask.py --graph results/test_graph.pkl \
+        --question "Where is the crane relative to the worker?" \
+        --question "What was visible at 10 seconds?"
 """
 
 import argparse
@@ -28,15 +28,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from vesta.agent.vesta_agent import VestaAgent
+from vesta.agent.scene_agent import SceneAgent
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Ask VESTA questions about a previously processed video"
     )
-    parser.add_argument("--registry", required=True,
-                        help="Path to saved registry (.pkl from run_pipeline.py)")
+    parser.add_argument("--graph", required=True,
+                        help="Path to saved graph (.pkl from run_pipeline.py)")
     parser.add_argument("--question", "-q", action="append",
                         help="Question to ask (can specify multiple). If omitted, enters interactive mode.")
     parser.add_argument("--model", default=None,
@@ -44,25 +44,26 @@ def main():
     args = parser.parse_args()
 
     # Load saved state
-    pkl_path = Path(args.registry)
+    pkl_path = Path(args.graph)
     if not pkl_path.exists():
-        print(f"Error: Registry file not found: {pkl_path}")
+        print(f"Error: Graph file not found: {pkl_path}")
         print(f"Run 'python scripts/run_pipeline.py --video <your_video>' first.")
         sys.exit(1)
 
     with open(pkl_path, "rb") as f:
         state = pickle.load(f)
 
-    # Reconstruct the agent with the saved registry
-    agent = VestaAgent(verbose=False)
-    agent.registry = state["registry"]
+    # Reconstruct the agent with the saved graph
+    agent = SceneAgent(verbose=False)
+    agent.graph = state["graph"]
     agent.frame_count = state["frame_count"]
     agent.fps = state["fps"]
     agent.model = args.model or state["model"]
     agent.processed = True
 
-    summary = agent.registry.get_summary()
-    print(f"[VESTA] Loaded registry: {summary['total_hazards']} hazards, "
+    summary = agent.graph.get_summary()
+    print(f"[VESTA] Loaded scene graph: {summary['total_entities']} entities, "
+          f"{summary['total_relationships']} relationships, "
           f"heading {summary['current_heading']}°, "
           f"{agent.frame_count} frames @ {agent.fps:.0f} FPS")
 
@@ -76,7 +77,7 @@ def main():
         return
 
     # Interactive mode
-    print("\nCommands: 'map' (full registry), 'quit' (exit)")
+    print("\nCommands: 'map' (all entities), 'quit' (exit)")
     while True:
         try:
             question = input("\nAsk VESTA: ").strip()
@@ -89,8 +90,8 @@ def main():
             break
         if question.lower() == "map":
             print()
-            for h in agent.registry.get_all():
-                print(f"  {agent.registry.describe_relative_to_camera(h)}")
+            for e in agent.graph.get_all():
+                print(f"  {agent.graph.describe_relative_to_camera(e)}")
             continue
 
         print()

@@ -1,8 +1,8 @@
 """
-3D Spatial Map — Bird's-eye and 3D visualization of hazard positions.
+3D Spatial Map — Bird's-eye and 3D visualization of entity positions.
 
 Uses monocular depth estimation (MiDaS via torch.hub) to estimate real-world
-distances to hazards, then projects them into a 3D coordinate system using
+distances to entities, then projects them into a 3D coordinate system using
 accumulated camera motion from optical flow.
 
 Output: Interactive Plotly HTML that judges can rotate, zoom, and explore.
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from vesta.flow.optical_flow import CameraMotion
-from vesta.registry.hazard_registry import HazardRegistry, HazardEntry
+from vesta.registry.scene_graph import SceneGraph, Entity
 
 
 # ── Depth Estimation ────────────────────────────────────────────────────────
@@ -117,12 +117,11 @@ class CameraPathPoint:
 
 
 @dataclass
-class HazardWorldPosition:
-    """A hazard projected into world coordinates."""
-    hazard_id: str
+class EntityWorldPosition:
+    """An entity projected into world coordinates."""
+    entity_id: str
     label: str
     category: str
-    severity: str
     confidence: float
     world_x: float
     world_y: float
@@ -170,54 +169,52 @@ def compute_camera_path(
     return path
 
 
-def project_hazards_to_world(
-    registry: HazardRegistry,
+def project_entities_to_world(
+    graph: SceneGraph,
     camera_path: list[CameraPathPoint],
     depth_scale: float = 3.0,
-) -> list[HazardWorldPosition]:
+) -> list[EntityWorldPosition]:
     """
-    Project all hazards from the registry into world XY coordinates.
+    Project all entities from the scene graph into world XY coordinates.
 
-    Uses each hazard's allocentric angle and distance estimate to place it
+    Uses each entity's allocentric angle and distance estimate to place it
     relative to the camera position at the time it was first detected.
     """
     positions = []
 
-    # Find the camera position closest to each hazard's first_seen timestamp
-    for hazard in registry.get_all(min_confidence=0.2):
+    for entity in graph.get_all(min_confidence=0.2):
         # Find camera position at first detection
         best_idx = 0
         best_diff = float("inf")
         for i, pt in enumerate(camera_path):
-            diff = abs(pt.timestamp - hazard.first_seen)
+            diff = abs(pt.timestamp - entity.first_seen)
             if diff < best_diff:
                 best_diff = diff
                 best_idx = i
 
         cam = camera_path[best_idx]
 
-        # Project hazard position from camera location + allocentric angle
-        dist = (1.0 - hazard.distance) * depth_scale + 0.5  # distance estimate
-        angle_rad = math.radians(hazard.allo_angle)
+        # Project entity position from camera location + allocentric angle
+        dist = (1.0 - entity.distance) * depth_scale + 0.5
+        angle_rad = math.radians(entity.allo_angle)
 
         world_x = cam.x + dist * math.sin(angle_rad)
         world_y = cam.y + dist * math.cos(angle_rad)
 
         # Z is based on the y-position in the frame (higher in frame = higher up)
-        world_z = hazard.distance * 2.0  # rough height estimate
+        world_z = entity.distance * 2.0
 
-        positions.append(HazardWorldPosition(
-            hazard_id=hazard.id,
-            label=hazard.label,
-            category=hazard.category,
-            severity=hazard.severity,
-            confidence=hazard.confidence,
+        positions.append(EntityWorldPosition(
+            entity_id=entity.id,
+            label=entity.label,
+            category=entity.category,
+            confidence=entity.confidence,
             world_x=world_x,
             world_y=world_y,
             world_z=world_z,
-            allo_angle=hazard.allo_angle,
+            allo_angle=entity.allo_angle,
             distance=dist,
-            first_seen=hazard.first_seen,
+            first_seen=entity.first_seen,
         ))
 
     return positions
@@ -225,24 +222,30 @@ def project_hazards_to_world(
 
 # ── Visualization ───────────────────────────────────────────────────────────
 
-SEVERITY_COLORS = {
-    "critical": "#FF0000",
-    "high": "#FF6600",
-    "medium": "#FFCC00",
-    "low": "#00CC00",
+CATEGORY_COLORS = {
+    "person":    "#3388FF",
+    "equipment": "#FFCC00",
+    "structure": "#999999",
+    "material":  "#00CC00",
+    "vehicle":   "#FF8800",
+    "signage":   "#00CCCC",
+    "unknown":   "#BBBBBB",
 }
 
-SEVERITY_SIZES = {
-    "critical": 18,
-    "high": 14,
-    "medium": 10,
-    "low": 8,
+CATEGORY_SIZES = {
+    "person":    14,
+    "equipment": 12,
+    "structure": 16,
+    "material":  10,
+    "vehicle":   16,
+    "signage":   10,
+    "unknown":   8,
 }
 
 
 def build_3d_map(
     camera_path: list[CameraPathPoint],
-    hazard_positions: list[HazardWorldPosition],
+    entity_positions: list[EntityWorldPosition],
     output_path: str = "results/site_map_3d.html",
 ) -> str:
     """
@@ -255,7 +258,6 @@ def build_3d_map(
     fig = go.Figure()
 
     # ── Camera path (blue line) ─────────────────────────────────────────
-    # Sample every 5th point to keep it clean
     sampled = camera_path[::5]
     fig.add_trace(go.Scatter3d(
         x=[p.x for p in sampled],
@@ -296,19 +298,19 @@ def build_3d_map(
         showlegend=False,
     ))
 
-    # ── Hazards by severity ─────────────────────────────────────────────
-    for severity in ["critical", "high", "medium", "low"]:
-        hazards = [h for h in hazard_positions if h.severity == severity]
-        if not hazards:
+    # ── Entities by category ─────────────────────────────────────────────
+    for category in ["person", "equipment", "structure", "material", "vehicle", "signage", "unknown"]:
+        entities = [e for e in entity_positions if e.category == category]
+        if not entities:
             continue
 
-        color = SEVERITY_COLORS[severity]
-        size = SEVERITY_SIZES[severity]
+        color = CATEGORY_COLORS.get(category, "#BBBBBB")
+        size = CATEGORY_SIZES.get(category, 10)
 
         fig.add_trace(go.Scatter3d(
-            x=[h.world_x for h in hazards],
-            y=[h.world_y for h in hazards],
-            z=[h.world_z for h in hazards],
+            x=[e.world_x for e in entities],
+            y=[e.world_y for e in entities],
+            z=[e.world_z for e in entities],
             mode="markers+text",
             marker=dict(
                 size=size,
@@ -316,27 +318,27 @@ def build_3d_map(
                 opacity=0.85,
                 line=dict(width=1, color="white"),
             ),
-            text=[h.label for h in hazards],
+            text=[e.label for e in entities],
             textposition="top center",
             textfont=dict(color="white", size=9),
-            name=f"{severity.upper()} ({len(hazards)})",
+            name=f"{category.upper()} ({len(entities)})",
             hovertemplate=(
                 "<b>%{text}</b><br>"
-                "Severity: " + severity.upper() + "<br>"
+                "Category: " + category.upper() + "<br>"
                 "Confidence: %{customdata[0]:.0%}<br>"
                 "First seen: T=%{customdata[1]:.1f}s<br>"
                 "Angle: %{customdata[2]:.0f}°"
                 "<extra></extra>"
             ),
-            customdata=[[h.confidence, h.first_seen, h.allo_angle] for h in hazards],
+            customdata=[[e.confidence, e.first_seen, e.allo_angle] for e in entities],
         ))
 
-        # Draw vertical lines from ground to hazard (z=0 to z=height)
-        for h in hazards:
+        # Draw vertical lines from ground to entity
+        for e in entities:
             fig.add_trace(go.Scatter3d(
-                x=[h.world_x, h.world_x],
-                y=[h.world_y, h.world_y],
-                z=[0, h.world_z],
+                x=[e.world_x, e.world_x],
+                y=[e.world_y, e.world_y],
+                z=[0, e.world_z],
                 mode="lines",
                 line=dict(color=color, width=1, dash="dot"),
                 showlegend=False,
@@ -346,7 +348,7 @@ def build_3d_map(
     # ── Layout ──────────────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
-            text="VESTA — 3D Site Hazard Map",
+            text="VESTA — 3D Scene Entity Map",
             font=dict(size=20, color="white"),
         ),
         scene=dict(
@@ -376,7 +378,7 @@ def build_3d_map(
 
 def build_2d_radar_map(
     camera_path: list[CameraPathPoint],
-    hazard_positions: list[HazardWorldPosition],
+    entity_positions: list[EntityWorldPosition],
     output_path: str = "results/site_map_2d.html",
 ) -> str:
     """Build a 2D bird's-eye-view map (top-down)."""
@@ -420,37 +422,40 @@ def build_2d_radar_map(
             arrowwidth=1.5, arrowcolor="#4488FF",
         )
 
-    # Hazards
-    for severity in ["critical", "high", "medium", "low"]:
-        hazards = [h for h in hazard_positions if h.severity == severity]
-        if not hazards:
+    # Entities by category
+    for category in ["person", "equipment", "structure", "material", "vehicle", "signage", "unknown"]:
+        entities = [e for e in entity_positions if e.category == category]
+        if not entities:
             continue
 
+        color = CATEGORY_COLORS.get(category, "#BBBBBB")
+        size = CATEGORY_SIZES.get(category, 10)
+
         fig.add_trace(go.Scatter(
-            x=[h.world_x for h in hazards],
-            y=[h.world_y for h in hazards],
+            x=[e.world_x for e in entities],
+            y=[e.world_y for e in entities],
             mode="markers+text",
             marker=dict(
-                size=[SEVERITY_SIZES[severity]] * len(hazards),
-                color=SEVERITY_COLORS[severity],
+                size=[size] * len(entities),
+                color=color,
                 line=dict(width=1, color="white"),
             ),
-            text=[h.label for h in hazards],
+            text=[e.label for e in entities],
             textposition="top center",
             textfont=dict(color="white", size=8),
-            name=f"{severity.upper()} ({len(hazards)})",
+            name=f"{category.upper()} ({len(entities)})",
             hovertemplate=(
                 "<b>%{text}</b><br>"
-                f"Severity: {severity.upper()}<br>"
+                f"Category: {category.upper()}<br>"
                 "Confidence: %{customdata[0]:.0%}<br>"
                 "T=%{customdata[1]:.1f}s"
                 "<extra></extra>"
             ),
-            customdata=[[h.confidence, h.first_seen] for h in hazards],
+            customdata=[[e.confidence, e.first_seen] for e in entities],
         ))
 
     fig.update_layout(
-        title=dict(text="VESTA — Bird's Eye Site Map", font=dict(size=18, color="white")),
+        title=dict(text="VESTA — Bird's Eye Scene Map", font=dict(size=18, color="white")),
         xaxis=dict(title="X", color="gray", gridcolor="#222", scaleanchor="y"),
         yaxis=dict(title="Y", color="gray", gridcolor="#222"),
         paper_bgcolor="#0D1117",
