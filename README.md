@@ -1,32 +1,42 @@
-# VESTA — Vision-Enhanced Spatial Tracking Agent
+# VESTA — Spatio-Temporal Scene Graph for Egocentric Video Understanding
 
-A stateful AI agent that detects and **remembers** construction site hazards from hardhat camera video. Unlike standard VLMs that forget everything between frames, VESTA maintains a persistent 360-degree hazard map — so a hole seen 30 seconds ago is still tracked even when the camera is facing the opposite direction.
+VESTA builds a **persistent, spatially-grounded scene graph** from egocentric video. Unlike standard VLMs that process each frame independently with no memory, VESTA tracks every entity (workers, equipment, structures, materials) with world-fixed coordinates and temporal observation history — enabling precise "what, where, when" queries that no frontier model can answer alone.
 
-Built for the UMD Ironsite Hackathon. Powered by Google Gemini 2.5 Flash + OpenCV optical flow + 18,694 real OSHA incident records.
+Built for the UMD Ironsite Hackathon. Powered by Google Gemini 2.5 Flash + OpenCV optical flow.
 
 ## How It Works
 
 ```
-Video Frame ──► Optical Flow (every frame) ──► Camera rotation [dx, dy, dθ]
-                                                        │
-Video Frame ──► Gemini Flash (every 30 frames) ──► Hazard detections [label, x, y]
-                                                        │
-                                                        ▼
-                                                ┌─────────────────┐
-                                                │  HAZARD REGISTRY │
-                                                │  (persistent map)│
-                                                └────────┬────────┘
-                                                         │
-                                        "What's behind me?" ──► Agent answers
-                                                                 using the map
+Video (hardhat-cam / egocentric)
+    │
+    ├── Every frame ──► Optical Flow (ORB + Affine) ──► Camera heading
+    │
+    └── Keyframes ────► Gemini Flash ──► Entities + Relationships + Scene description
+                                                │
+                                                ▼
+                                    ┌──────────────────────┐
+                                    │   SCENE GRAPH         │
+                                    │   Entities (nodes)    │
+                                    │   + world-fixed coords│
+                                    │   + observation chain  │
+                                    │   + relationships      │
+                                    └───────────┬──────────┘
+                                                │
+                                   "Where is the crane relative
+                                    to the worker at 10s?"
+                                                │
+                                    ┌───────────┴──────────┐
+                                    │ Spatial → geometric   │
+                                    │   "right, ~45°"       │
+                                    │ Temporal → retrieve    │
+                                    │   observation history  │
+                                    └──────────────────────┘
 ```
 
-The pipeline runs in **2 overlapped passes** for speed:
+The pipeline runs in **2 overlapped passes**:
 
-1. **Pass 1+2 (overlapped):** Read frames, run ORB optical flow, and **submit keyframes to Gemini instantly** as they're identified (4 parallel workers). By the time the last frame is read, most Gemini results are already back. Flow + Gemini run simultaneously.
-2. **Pass 3 (fast, ~1s):** Replay the motion sequence, convert pixel detections to world-fixed polar angles, build the hazard registry, write annotated video
-
-After processing, the **agent** answers spatial questions ("what's behind me?") by querying the registry and citing real OSHA incident data.
+1. **Pass 1+2 (overlapped):** Read frames, run ORB optical flow on every frame, and **submit keyframes to Gemini in parallel** (4 workers). Gemini latency is hidden behind flow computation.
+2. **Pass 3 (fast, <1s):** Replay motion, inject entities + relationships into scene graph, write annotated video with bounding boxes + radar minimap.
 
 ## Quick Start
 
@@ -49,201 +59,104 @@ pip install -r requirements.txt
 echo "GEMINI_API_KEY=your-key-here" > .env
 ```
 
-## Usage — Two Commands
+## Usage
 
-### Command 1: Process a video
+### 1. Process a Video
 
-This is the heavy step — it analyzes the video, detects hazards, and saves everything.
+Analyze video, build scene graph, generate outputs.
 
 ```bash
-# Full video processing (generates annotated video + JSON + saved registry)
-python scripts/run_pipeline.py --video data/test_videos/test.mp4
+# Full video processing
+python scripts/run_pipeline.py --video data/test_videos/test_2.mp4
 
-# Quick test — only first 150 frames (~5 seconds)
-python scripts/run_pipeline.py --video data/test_videos/test.mp4 --max-frames 150
+# Quick test — first 150 frames (~10 seconds)
+python scripts/run_pipeline.py --video data/test_videos/test_2.mp4 --max-frames 150
 
-# Process without interactive mode (just save outputs and exit)
-python scripts/run_pipeline.py --video data/test_videos/test.mp4 --no-interactive
+# Process without interactive Q&A (just save outputs)
+python scripts/run_pipeline.py --video data/test_videos/test_2.mp4 --no-interactive
 ```
 
-**What it produces** (saved to `results/`):
+**Output files** (saved to `results/`):
 
 | File | What |
 |------|------|
-| `results/<video>_annotated.mp4` | Video with hazard crosshairs + radar minimap + status bar |
-| `results/<video>_results.json` | Full hazard registry as JSON (every hazard with angle, severity, confidence, timestamps) |
-| `results/<video>_registry.pkl` | Saved agent state — use this with `scripts/ask.py` to ask questions without re-processing |
-| `results/<video>_map_3d.html` | Interactive 3D Plotly map — camera path + hazard positions (rotate, zoom, explore) |
-| `results/<video>_map_2d.html` | Bird's-eye 2D map — top-down view with heading arrows |
+| `<video>_annotated.mp4` | Video with entity bounding boxes + radar minimap + status bar |
+| `<video>_results.json` | Full scene graph as JSON (entities, relationships, positions) |
+| `<video>_graph.pkl` | Saved agent state — use with `scripts/ask.py` for instant Q&A |
+| `<video>_map_3d.html` | Interactive 3D Plotly map (camera path + entity positions) |
+| `<video>_map_2d.html` | Bird's-eye 2D map with heading arrows |
 
-After processing, it drops you into interactive mode where you can type questions.
+After processing, it drops into interactive Q&A mode.
 
-### Command 2: Ask questions (no re-processing)
+### 2. Ask Questions (No Re-Processing)
 
-Once you've processed a video, you can ask unlimited questions instantly using the saved registry:
-
-```bash
-# Interactive mode — ask multiple questions in a conversation
-python scripts/ask.py --registry results/test_registry.pkl
-
-# Single question (great for scripting/demos)
-python scripts/ask.py --registry results/test_registry.pkl -q "What hazards are behind me?"
-
-# Multiple questions at once
-python scripts/ask.py --registry results/test_registry.pkl \
-  -q "List all fall risks and how severe they are" \
-  -q "Give me a full safety briefing for this site"
-```
-
-### Interactive Commands
-
-When in interactive mode (either script), you can type:
-
-```
-Ask VESTA: What hazards are in front of me?
-Ask VESTA: List all fall risks and their severity
-Ask VESTA: Give me a full safety briefing for this site
-Ask VESTA: map                          ← dumps the full hazard registry
-Ask VESTA: quit                         ← exit
-```
-
-### Run Tests (No API Key Needed)
+Load a saved scene graph and ask unlimited questions instantly:
 
 ```bash
+# Interactive mode
+python scripts/ask.py --graph results/test_2_graph.pkl
+
+# Single question
+python scripts/ask.py --graph results/test_2_graph.pkl -q "What's behind me?"
+
+# Multiple questions
+python scripts/ask.py --graph results/test_2_graph.pkl \
+  -q "Where is the crane relative to the worker?" \
+  -q "What was visible at 10 seconds?" \
+  -q "How many workers are on site?"
+```
+
+### Example Questions
+
+```
+Ask VESTA: What's behind me?
+Ask VESTA: Where is the scaffolding relative to the worker?
+Ask VESTA: What entities were visible at 5 seconds?
+Ask VESTA: How did the wall change over time?
+Ask VESTA: What's near the crane?
+Ask VESTA: How many workers are on site?
+Ask VESTA: map                   ← dumps all entities with positions
+Ask VESTA: quit                  ← exit
+```
+
+### 3. Run Tests (No API Key Needed)
+
+```bash
+# Scene graph tests (14 tests)
+python tests/test_scene_graph.py
+
+# Hazard registry tests (7 tests)
 python tests/test_registry.py
 ```
 
-Tests the core spatial logic — coordinate transforms, hazard persistence, rotation tracking, and directional queries — all without hitting the Gemini API.
+Tests cover: entity creation, merging, object permanence, direction queries, rotation tracking, temporal queries, relationships, spatial relations, confidence decay.
 
 ## Real-Time Mode
 
-VESTA also runs **live** on a webcam or video feed — processing optical flow on every frame in the main thread and running Gemini detection in background threads, with live annotated display and spoken audio alerts.
-
-### Usage
+Live processing on webcam or video feed with spoken audio alerts and optional 3D web visualization.
 
 ```bash
 # Live from webcam
 python realtime/run.py
 
 # From a video file
-python realtime/run.py --video data/test_videos/test.mp4
+python realtime/run.py --video data/test_videos/test_2.mp4
 
-# With interactive Q&A after the video ends
-python realtime/run.py --video data/test_videos/test.mp4 --ask
+# With Q&A after video ends
+python realtime/run.py --video data/test_videos/test_2.mp4 --ask
+
+# With 3D web visualization (opens localhost:8080)
+python realtime/run.py --video data/test_videos/test_2.mp4 --viz
 
 # Disable audio alerts
-python realtime/run.py --video data/test_videos/test.mp4 --no-audio
+python realtime/run.py --no-audio
 ```
 
-### Controls
-
-| Key | Action |
-|-----|--------|
-| `Q` | Quit |
-| `Space` | Pause / Resume |
-| `S` | Save screenshot |
-
-### How It Works
-
-```
-┌──────────── MAIN THREAD (~30+ fps) ──────────────────────────┐
-│  cap.read() → optical flow (14ms) → update heading           │
-│  → keyframe? submit to background → collect results           │
-│  → proximity check → audio alert → annotate → display         │
-├──────────── BACKGROUND THREADS ──────────────────────────────┤
-│  ThreadPoolExecutor (2 workers): Gemini detection (~2-5s)     │
-│  AlertSpeaker thread: pyttsx3 TTS for spoken warnings         │
-└───────────────────────────────────────────────────────────────┘
-```
-
-The main thread never blocks on Gemini. Keyframes are submitted to a thread pool; results are collected on the next frame loop iteration. Hazards appear in the overlay ~2-5s after first entering the frame.
-
-### Intelligent Audio Alerts
-
-The proximity tracker evaluates every hazard's position relative to the worker each frame and generates **escalating spoken warnings**:
-
-| Situation | Example Alert |
-|-----------|---------------|
-| First detection (critical/high) | "Hazard detected: floor opening, directly behind you" |
-| Nearby | "Floor opening detected behind you, nearby" |
-| Approaching (distance decreasing) | "Caution, you're moving toward the floor opening behind you" |
-| Very close | "Warning, floor opening very close, directly behind you" |
-| Imminent danger | "Stop! Floor opening right behind you!" |
-
-Alerts escalate based on distance trend (are you getting closer?), blind spot detection (hazards behind you are more urgent), and severity. Each level has its own cooldown to prevent spam.
-
-### Real-Time Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--video` | webcam | Path to video file |
-| `--webcam` | 0 | Webcam device index |
-| `--ask` | false | Interactive Q&A after session ends |
-| `--no-audio` | false | Disable spoken audio alerts |
-| `--keyframe-interval` | 60 | Frames between Gemini samples |
-| `--workers` | 2 | Background Gemini threads |
-| `--model` | `gemini-2.5-flash` | Gemini model ID |
-
-## Performance
-
-Both pipelines benefit from automatic resolution-adaptive processing:
-
-| Optimization | Before | After | Improvement |
-|---|---|---|---|
-| Optical flow (1080p input) | 65ms/frame | 14ms/frame | **4.7x faster** |
-| Gemini payload size | 1,531 KB | 365 KB | **76% smaller** |
-| Flow FPS ceiling | ~15 fps | ~74 fps | Headroom for all other processing |
-
-- **Optical flow auto-downscales** to 640px width internally — ORB feature detection is O(w*h), so 480p is 4.4x faster than 1080p with no accuracy loss on rotation estimation
-- **Gemini frames auto-downscale** to 1280px and encode at JPEG quality 70 — 720p is more than enough for hazard detection, and 4x smaller payloads mean faster network transfer
-- **Live performance metrics** are shown on-screen in real-time mode: FPS, flow time, annotation time, and Gemini round-trip
-
-## Project Structure
-
-```
-Ironsite/
-├── vesta/                          ← Core VESTA package
-│   ├── flow/
-│   │   └── optical_flow.py         ← Camera motion estimation (ORB features + RANSAC)
-│   ├── detection/
-│   │   └── gemini_detector.py      ← Gemini 2.5 Flash hazard detection + parallel batching
-│   ├── registry/
-│   │   └── hazard_registry.py      ← Stateful hazard map with ego/allo coordinate transforms
-│   ├── agent/
-│   │   └── vesta_agent.py          ← Orchestrator: 3-pass pipeline + Gemini tool-calling for Q&A
-│   └── utils/
-│       ├── osha_lookup.py          ← OSHA incident narrative search
-│       ├── visualizer.py           ← Video annotation: crosshairs, radar minimap, status bar
-│       └── spatial_map.py          ← 3D/2D spatial maps with camera path + hazard projection
-│
-├── realtime/                       ← Real-time pipeline
-│   ├── realtime_pipeline.py        ← Live processing: main loop + background Gemini threads
-│   ├── audio_alerts.py             ← Proximity tracker + escalating TTS warnings
-│   └── run.py                      ← Entry point: webcam/video with CLI args
-│
-├── scripts/
-│   ├── run_pipeline.py             ← Command 1: Process video → detect → save results + maps
-│   ├── ask.py                      ← Command 2: Ask questions from saved registry (instant)
-│   └── generate_map.py             ← Regenerate spatial maps from saved registry
-│
-├── data/
-│   ├── osha/                       ← 13 OSHA CSV files (~2.3GB, not in repo)
-│   ├── test_videos/                ← Drop your test videos here
-│   └── test_frames/                ← Extracted keyframes
-│
-├── results/                        ← Output: annotated videos, JSON, saved registries
-├── tests/
-│   └── test_registry.py            ← Unit tests (7 tests, no API key needed)
-├── docs/
-│   ├── VESTA_CORE_IDEA.md          ← One-paragraph explanation of the core concept
-│   └── OSHA_ENGINE_SPEC.md         ← Build spec for the OSHA engine module
-│
-├── requirements.txt
-├── VESTA_PLAN.md                   ← Full architecture plan
-└── .env                            ← Your GEMINI_API_KEY (not committed)
-```
+**Controls:** `Q` = quit, `Space` = pause, `S` = screenshot
 
 ## Configuration
+
+### Standalone Pipeline (`scripts/run_pipeline.py`)
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -251,35 +164,74 @@ Ironsite/
 | `--max-frames` | all | Limit frames to process |
 | `--keyframe-interval` | 30 | Frames between Gemini API calls |
 | `--model` | `gemini-2.5-flash` | Gemini model to use |
-| `--no-interactive` | false | Skip interactive query mode |
+| `--no-interactive` | false | Skip interactive Q&A mode |
 | `--output-video` | auto | Custom path for annotated video |
 
-## How Each File Works
+### Real-Time Pipeline (`realtime/run.py`)
 
-| File | What It Does | How |
-|------|-------------|-----|
-| `optical_flow.py` | Estimates camera rotation between frames | ORB feature detection → match features → RANSAC affine fit → decompose to dx, dy, rotation angle |
-| `gemini_detector.py` | Detects hazards in keyframes | Encodes frame as JPEG → sends to Gemini 2.5 Flash with OSHA hazard prompt → parses JSON response with hazard labels + pixel coordinates |
-| `hazard_registry.py` | Maintains the persistent hazard map | Converts pixel coords → egocentric angle → allocentric (world-fixed) angle. Merges duplicates. Decays stale entries. Answers directional queries. |
-| `vesta_agent.py` | Orchestrates everything | Runs 3-pass pipeline (flow → parallel Gemini → registry). Exposes tools for Gemini to query the registry. Handles natural language Q&A. |
-| `visualizer.py` | Draws overlays on video frames | Crosshair markers on detections, 360° radar minimap with FOV cone, severity-colored dots, status bar |
-| `osha_lookup.py` | Searches OSHA incident records | Keyword search over 18,694 construction incident narratives. Returns real stories + days-away-from-work data. |
-| `spatial_map.py` | Generates interactive spatial maps | Accumulates camera motion into a world-space path, projects hazards using allocentric angles + distance, outputs interactive Plotly 3D and 2D bird's-eye HTML maps |
-| `realtime_pipeline.py` | Live real-time processing loop | Main thread: optical flow + heading update + annotate at ~30fps. Background: ThreadPoolExecutor submits keyframes to Gemini. Lock-based thread safety around registry. |
-| `audio_alerts.py` | Intelligent spoken warnings | Tracks per-hazard proximity history (ego angle + distance trend). Detects approach via rolling window analysis. Escalates through 5 alert levels with per-level cooldowns. pyttsx3 TTS on daemon thread. |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--video` | webcam | Path to video file |
+| `--webcam` | 0 | Webcam device index |
+| `--ask` | false | Q&A mode after session |
+| `--viz` | false | Launch 3D web viz (localhost:8080) |
+| `--no-audio` | false | Disable spoken alerts |
+| `--keyframe-interval` | 60 | Frames between Gemini samples |
+| `--workers` | 2 | Background Gemini threads |
+| `--model` | `gemini-2.5-flash` | Gemini model ID |
 
-## OSHA Data
+## Project Structure
 
-The `data/osha/` directory contains 13 OSHA ITA (Injury Tracking Application) CSV files spanning 2016-2025. The two Case Detail files contain **18,694 construction-specific incident records** with narratives describing what happened, what injuries occurred, and how many days workers were away.
+```
+Ironsite/
+├── vesta/                              ← Core library
+│   ├── flow/
+│   │   └── optical_flow.py             ← Camera motion estimation (ORB + RANSAC)
+│   ├── detection/
+│   │   ├── gemini_detector.py          ← Gemini hazard detection (legacy)
+│   │   └── scene_descriptor.py         ← Full scene extraction (entities + relationships)
+│   ├── registry/
+│   │   ├── hazard_registry.py          ← Allocentric hazard map (legacy)
+│   │   └── scene_graph.py              ← Spatio-temporal scene graph
+│   ├── agent/
+│   │   ├── vesta_agent.py              ← Hazard-only agent (legacy)
+│   │   └── scene_agent.py              ← Scene graph agent with 7 tools
+│   └── utils/
+│       ├── visualizer.py               ← Video annotation (bboxes + radar minimap)
+│       └── spatial_map.py              ← 3D/2D maps (MiDaS depth + Plotly)
+│
+├── realtime/                           ← Real-time pipeline
+│   ├── realtime_pipeline.py            ← Live processing loop (threading)
+│   ├── audio_alerts.py                 ← Escalating spoken warnings (pyttsx3)
+│   ├── trajectory.py                   ← Predictive collision warning
+│   ├── web_viz.py                      ← Flask-SocketIO 3D server
+│   ├── run.py                          ← CLI entry point
+│   └── static/index.html              ← Three.js 3D visualization
+│
+├── scripts/
+│   ├── run_pipeline.py                 ← Process video → scene graph → outputs
+│   ├── ask.py                          ← Query saved graph (instant Q&A)
+│   └── generate_map.py                 ← Regenerate spatial maps
+│
+├── tests/
+│   ├── test_scene_graph.py             ← 14 scene graph tests
+│   └── test_registry.py               ← 7 hazard registry tests
+│
+├── data/
+│   └── test_videos/                    ← Drop your test videos here
+│
+├── results/                            ← Output directory
+├── requirements.txt
+└── .env                                ← GEMINI_API_KEY (not committed)
+```
 
-This data is not included in the repo due to size (~2.3GB). Download from [OSHA ITA Data](https://www.osha.gov/Establishment-Specific-Injury-and-Illness-Data).
+## Performance
 
-## Team
-
-| Role | What They Build |
-|------|----------------|
-| Core Pipeline | VESTA agent, optical flow, registry, detection |
-| OSHA Engine | SQLite indexer, RAG retriever, risk scorer, stats |
-| Demo UI | Streamlit/Gradio app with radar map + chat |
-| Voice I/O | Whisper STT + TTS for hands-free interaction |
-| Spatial Map | Bird's-eye-view visualization of camera path + hazards |
+| Metric | Value |
+|--------|-------|
+| Optical flow | ~55 FPS (ORB, 640x480) |
+| Gemini Flash latency | ~5s per keyframe |
+| Pipeline throughput (overlapped) | 150 frames in 33s |
+| Scene graph size | ~20-30 entities per minute |
+| Q&A response time | 2-5s |
+| Heading drift | <2° over 60s |

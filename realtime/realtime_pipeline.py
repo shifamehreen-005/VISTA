@@ -19,6 +19,7 @@ from vesta.detection.gemini_detector import KeyframeSampler, detect_hazards, Fra
 from vesta.registry.hazard_registry import HazardRegistry
 from vesta.utils.visualizer import VideoVisualizer
 from realtime.audio_alerts import ProximityTracker, AlertSpeaker, AlertLevel
+from realtime.trajectory import TrajectoryPredictor
 
 
 class RealtimeVesta:
@@ -43,6 +44,7 @@ class RealtimeVesta:
         max_workers: int = 2,
         decay_every_n: int = 30,
         audio_alerts: bool = True,
+        enable_viz: bool = False,
         verbose: bool = True,
     ):
         self.model = model
@@ -58,6 +60,16 @@ class RealtimeVesta:
             min_cooldown=min_cooldown,
         )
         self.visualizer = VideoVisualizer()
+
+        # Trajectory prediction
+        self._trajectory = TrajectoryPredictor()
+
+        # 3D web visualization
+        self._viz_server = None
+        self._viz_push_interval = 5  # push to browser every N frames
+        if enable_viz:
+            from realtime.web_viz import LiveVizServer
+            self._viz_server = LiveVizServer()
 
         # Audio alert system
         self._proximity_tracker = ProximityTracker()
@@ -112,6 +124,11 @@ class RealtimeVesta:
                 print(f"[VESTA RT] Total frames: {total} ({total / self.fps:.1f}s)")
 
         self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+
+        # Start 3D viz server if enabled
+        if self._viz_server is not None:
+            self._viz_server.start()
+
         prev_frame = None
         self.frame_idx = 0
 
@@ -148,9 +165,10 @@ class RealtimeVesta:
                 a = self._perf_alpha
                 self._perf_flow_ms = a * flow_ms + (1 - a) * self._perf_flow_ms
 
-                # 2. Update registry heading (thread-safe)
+                # 2. Update registry heading + trajectory (thread-safe)
                 with self._lock:
                     self.registry.update_with_motion(motion)
+                self._trajectory.update(motion)
 
                 # 3. Keyframe sampling -> submit to background
                 is_keyframe = self.sampler.should_sample(self.frame_idx, motion)
@@ -169,6 +187,10 @@ class RealtimeVesta:
                         self._speaker.speak(level, message)
                         if self.verbose:
                             print(f"[VESTA AUDIO] [{level.name}] {message}")
+
+                # 5b. Push state to 3D web viz
+                if self._viz_server and self.frame_idx % self._viz_push_interval == 0:
+                    self._push_viz_state()
 
                 # 6. Periodic confidence decay
                 if self.frame_idx % self.decay_every_n == 0 and self.frame_idx > 0:
@@ -289,6 +311,44 @@ class RealtimeVesta:
                 print(f"\n[VESTA RT] Session ended.")
                 print(f"[VESTA RT] Processed {self.frame_idx} frames.")
                 print(f"[VESTA RT] {summary['total_hazards']} hazards in registry.")
+
+    def _push_viz_state(self):
+        """Compute trajectory prediction and push full state to the 3D web viz."""
+        predicted_path = self._trajectory.predict_path(fps=self.fps)
+
+        with self._lock:
+            collisions = self._trajectory.check_collisions(
+                self.registry, predicted_path, fps=self.fps
+            )
+            hazard_positions = self._trajectory.get_hazard_world_positions(self.registry)
+
+        # Trim path for network efficiency (every 3rd point)
+        full_path = self._trajectory.get_path()
+        sparse_path = full_path[::3] if len(full_path) > 30 else full_path
+
+        data = {
+            "worker": {
+                "x": self._trajectory.x,
+                "y": self._trajectory.y,
+                "heading": self.registry.current_heading,
+            },
+            "path": sparse_path,
+            "hazards": hazard_positions,
+            "prediction": {
+                "points": predicted_path,
+                "collisions": [
+                    {
+                        "hazard_id": c.hazard_id,
+                        "label": c.label,
+                        "eta_seconds": c.eta_seconds,
+                        "hazard_x": c.hazard_x,
+                        "hazard_y": c.hazard_y,
+                    }
+                    for c in collisions
+                ],
+            },
+        }
+        self._viz_server.push_state(data)
 
     def _submit_detection(self, frame_snapshot: np.ndarray, frame_idx: int):
         """Submit a frame to background Gemini detection."""
