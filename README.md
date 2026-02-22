@@ -1,6 +1,6 @@
 # VISTA — Video Intelligence with Spatio-Temporal Augmented Retrieval for Egocentric Understanding
 
-VISTA(referenced VESTA in some places) builds a **persistent, spatially-grounded scene graph** from egocentric video. Unlike standard VLMs that process each frame independently with no memory, VESTA tracks every entity (workers, equipment, structures, materials) with world-fixed coordinates and temporal observation history — enabling precise "what, where, when" queries that no frontier model can answer alone.
+VISTA (referenced as VESTA, in some places) builds a **persistent, spatially-grounded scene graph** from egocentric video. Unlike standard VLMs that process each frame independently with no memory, VESTA tracks every entity (workers, equipment, structures, materials) with world-fixed coordinates and temporal observation history — enabling precise "what, where, when" queries that no frontier model can answer alone.
 
 Built for the UMD Ironsite Hackathon. Powered by Google Gemini 3 Flash + OpenCV optical flow.
 
