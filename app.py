@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 # -----------------------------
 # Page config
@@ -18,6 +17,7 @@ import streamlit.components.v1 as components
 st.set_page_config(
     page_title="Video Intelligence with Spatio-Temporal Augmented Retrieval for Egocentric Understanding",
     layout="wide",
+    page_icon="▶",  # Favicon (emoji) avoids ERR_FILE_NOT_FOUND for missing favicon.ico
 )
 
 # -----------------------------
@@ -66,7 +66,7 @@ st.markdown(
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(101, 67, 43, 0.3);
+  background: rgba(101, 67, 43, 0.05);
   z-index: 0;
   pointer-events: none;
 }
@@ -84,6 +84,19 @@ section[data-testid="stHeader"] {
   padding-right: 2.5rem;
   max-width: 100%;
   box-sizing: border-box;
+}
+
+/* ---------- Video player: rounded borders ---------- */
+[data-testid="stVideo"],
+[data-testid="stVideo"] > div,
+[data-testid="stVideo"] video,
+.stApp video {
+  border-radius: 12px !important;
+  overflow: hidden !important;
+}
+[data-testid="stVideo"] video,
+.stApp video {
+  display: block !important;
 }
 
 /* ---------- Ensure all text is visible (light theme) ---------- */
@@ -572,7 +585,7 @@ if "video_name" not in st.session_state:
 if "play_from" not in st.session_state:
     st.session_state.play_from = 0.0
 if "video_duration" not in st.session_state:
-    st.session_state.video_duration = 300.0
+    st.session_state.video_duration = 900.0  # 15 min fallback
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_jump" not in st.session_state:
@@ -604,11 +617,20 @@ def get_video_duration(video_bytes: bytes) -> float:
             return frames / fps
     except Exception:
         pass
-    return 300.0
+    return 900.0  # 15 min fallback when duration cannot be detected
 
 
 def seek_to(timestamp_s: float, duration: float) -> float:
     return max(0.0, min(float(timestamp_s), duration))
+
+
+# Default video: load check.mp4 from project dir if no video set yet
+_default_video_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.mp4")
+if st.session_state.video_bytes is None and os.path.isfile(_default_video_path):
+    with open(_default_video_path, "rb") as _f:
+        st.session_state.video_bytes = _f.read()
+    st.session_state.video_name = "check.mp4"
+    st.session_state.video_duration = get_video_duration(st.session_state.video_bytes)
 
 
 def _video_player_html(video_base64: str, mime: str, start_time: float) -> str:
@@ -978,21 +1000,23 @@ with left:
             unsafe_allow_html=True,
         )
     else:
-        start = float(st.session_state.play_from)
-        if st.session_state.last_jump is not None:
-            start = float(st.session_state.last_jump)
-            st.session_state.last_jump = None
-
-        # Infer mime from filename
         name = st.session_state.video_name or "video.mp4"
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else "mp4"
         mime_map = {"mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm", "m4v": "video/x-m4v"}
         mime = mime_map.get(ext, "video/mp4")
-
-        b64 = base64.b64encode(st.session_state.video_bytes).decode("utf-8")
-        html = _video_player_html(b64, mime, start)
-
-        components.html(html, height=460, scrolling=False)
+        # Default video: serve from file path so /media/ 404 is avoided
+        _check_mp4_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.mp4")
+        if name == "check.mp4" and os.path.isfile(_check_mp4_path):
+            st.video(_check_mp4_path, format="video/mp4")
+        else:
+            try:
+                suffix = "." + ext if ext in ("mp4", "mov", "webm", "m4v") else ".mp4"
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(st.session_state.video_bytes)
+                    tmp_path = tmp.name
+                st.video(tmp_path, format=mime)
+            except Exception:
+                st.video(st.session_state.video_bytes, format=mime)
 
 # -----------------------------
 # Right: Chat
@@ -1052,7 +1076,7 @@ with right:
             res = answer_question(st.session_state.video_bytes, user_q)
 
         if res.timestamp_s is not None:
-            st.session_state.play_from = seek_to(res.timestamp_s, st.session_state.video_duration if st.session_state.video_bytes else 300)
+            st.session_state.play_from = seek_to(res.timestamp_s, st.session_state.video_duration if st.session_state.video_bytes else 900)
             st.session_state.last_jump = st.session_state.play_from
 
         st.session_state.messages.append(

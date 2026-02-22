@@ -1,0 +1,3 @@
+# Allow larger uploads for 15+ minute videos (default is 200 MB)
+[server]
+maxUploadSize = 500
