@@ -2,7 +2,7 @@
 
 VESTA builds a **persistent, spatially-grounded scene graph** from egocentric video. Unlike standard VLMs that process each frame independently with no memory, VESTA tracks every entity (workers, equipment, structures, materials) with world-fixed coordinates and temporal observation history — enabling precise "what, where, when" queries that no frontier model can answer alone.
 
-Built for the UMD Ironsite Hackathon. Powered by Google Gemini 2.5 Flash + OpenCV optical flow.
+Built for the UMD Ironsite Hackathon. Powered by Google Gemini 3 Flash + OpenCV optical flow.
 
 ## How It Works
 
