@@ -47,6 +47,8 @@ def main():
                         help="Frames between Gemini API calls (default: 30)")
     parser.add_argument("--model", default="gemini-2.5-flash",
                         help="Gemini model ID (default: gemini-2.5-flash)")
+    parser.add_argument("--workers", type=int, default=10,
+                        help="Max concurrent Gemini API calls (default: 10)")
     parser.add_argument("--no-interactive", action="store_true",
                         help="Skip interactive query mode after processing")
     parser.add_argument("--output-video", type=str, default=None,
@@ -67,6 +69,7 @@ def main():
         video_path=args.video,
         keyframe_interval=args.keyframe_interval,
         model=args.model,
+        max_workers=args.workers,
     )
 
     print("=" * 60)
@@ -105,6 +108,7 @@ def main():
             "fps": agent.fps,
             "model": agent.model,
             "motions": agent.motions,
+            "video_path": str(Path(args.video).resolve()),
         }, f)
 
     # ── Generate spatial maps ─────────────────────────────────────────

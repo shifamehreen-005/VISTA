@@ -103,6 +103,33 @@ def describe_scene(
     return _parse_scene_response(response.text)
 
 
+async def describe_scene_async(
+    frame: np.ndarray,
+    model: str = "gemini-2.5-flash",
+) -> SceneAnalysis:
+    """Async version of describe_scene — uses Gemini's native async API."""
+    import google.genai as genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    jpeg_bytes = frame_to_jpeg_bytes(frame)
+
+    response = await client.aio.models.generate_content(
+        model=model,
+        contents=[
+            types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+            SCENE_PROMPT,
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+        ),
+    )
+
+    return _parse_scene_response(response.text)
+
+
 def _repair_truncated_json(text: str) -> str | None:
     """Attempt to repair JSON truncated mid-output by closing open structures."""
     # Find the last complete entity or relationship object

@@ -2,7 +2,7 @@
 """
 Direct VLM Baseline — Ask Gemini questions about a video with NO scene graph.
 
-Sends sampled frames directly to Gemini and asks questions.
+Sends the video directly to Gemini (inline for <20MB, File API for larger).
 This is the baseline to compare against VESTA's scene graph approach.
 
 Usage:
@@ -13,18 +13,14 @@ Usage:
     # Interactive mode
     python benchmark/ask_vlm_direct.py --video data/test_videos/test_2.mp4
 
-    # Custom number of frames to sample
-    python benchmark/ask_vlm_direct.py --video data/test_videos/test_2.mp4 \
-        --frames 10 -q "Where is the scaffolding relative to the worker?"
-
     # Run the eval set for comparison
     python benchmark/ask_vlm_direct.py --video data/test_videos/test_2.mp4 --eval
 """
 
 import argparse
-import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -32,56 +28,59 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-import cv2
 import google.genai as genai
 from google.genai import types
 
 
-def sample_frames(video_path: str, num_frames: int = 8) -> list[bytes]:
-    """Sample evenly-spaced frames from a video, return as JPEG bytes."""
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
-    indices = [int(i * total / num_frames) for i in range(num_frames)]
-    frames = []
-
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        # Downscale to 720p max
-        h, w = frame.shape[:2]
-        if w > 1280:
-            scale = 1280 / w
-            frame = cv2.resize(frame, (1280, int(h * scale)))
-        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        frames.append(buf.tobytes())
-
-    cap.release()
-    print(f"[BASELINE] Sampled {len(frames)} frames from {total} total ({total/fps:.1f}s)")
-    return frames
+MAX_INLINE_SIZE = 20 * 1024 * 1024  # 20MB
 
 
-def ask_direct(frames: list[bytes], question: str, model: str = "gemini-2.5-flash") -> str:
-    """Send frames + question directly to Gemini. No scene graph, no tools."""
+def load_video(video_path: str) -> types.Part:
+    """Load video as a Gemini Part. Inline for <20MB, File API for larger."""
+    file_size = os.path.getsize(video_path)
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    parts = []
-    for i, jpg in enumerate(frames):
-        parts.append(types.Part.from_bytes(data=jpg, mime_type="image/jpeg"))
+    if file_size <= MAX_INLINE_SIZE:
+        print(f"[BASELINE] Loading video inline ({file_size / 1024 / 1024:.1f}MB)")
+        video_bytes = open(video_path, "rb").read()
+        return types.Part(
+            inline_data=types.Blob(data=video_bytes, mime_type="video/mp4")
+        )
+    else:
+        print(f"[BASELINE] Uploading video via File API ({file_size / 1024 / 1024:.1f}MB)...")
+        uploaded = client.files.upload(
+            file=video_path,
+            config=types.UploadFileConfig(mime_type="video/mp4"),
+        )
+        # Wait for processing
+        while uploaded.state == "PROCESSING":
+            print(f"[BASELINE] Processing... ({uploaded.name})")
+            time.sleep(2)
+            uploaded = client.files.get(name=uploaded.name)
+        if uploaded.state == "FAILED":
+            raise RuntimeError(f"File upload failed: {uploaded.name}")
+        print(f"[BASELINE] Upload complete: {uploaded.name}")
+        return types.Part.from_uri(file_uri=uploaded.uri, mime_type="video/mp4")
 
-    parts.append(
-        f"These are {len(frames)} evenly-sampled frames from a first-person (egocentric) "
-        f"video. Frame 1 is the start, frame {len(frames)} is the end.\n\n"
-        f"Question: {question}\n\n"
-        f"Answer precisely and concisely."
+
+def ask_direct(video_part: types.Part, question: str, model: str = "gemini-2.5-flash") -> str:
+    """Send video + question directly to Gemini. No scene graph, no tools."""
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+    contents = types.Content(
+        parts=[
+            video_part,
+            types.Part(text=
+                f"This is a first-person (egocentric) video from a construction site camera.\n\n"
+                f"Question: {question}\n\n"
+                f"Answer precisely and concisely."
+            ),
+        ]
     )
 
     response = client.models.generate_content(
         model=model,
-        contents=parts,
+        contents=contents,
         config=types.GenerateContentConfig(temperature=0.3),
     )
 
@@ -90,7 +89,7 @@ def ask_direct(frames: list[bytes], question: str, model: str = "gemini-2.5-flas
     return "[No response]"
 
 
-def run_eval(frames: list[bytes], model: str):
+def run_eval(video_part: types.Part, model: str):
     """Run the same eval set used for VESTA, score the baseline."""
     from tests.eval_spatial import EVAL_SET
 
@@ -108,9 +107,10 @@ def run_eval(frames: list[bytes], model: str):
         expected_none = q["expected_none"]
 
         print(f"  [{i+1}/{total}] {question}")
+        print(f"         Expected: {q.get('short_answer', '?')}")
 
         try:
-            answer = ask_direct(frames, question, model)
+            answer = ask_direct(video_part, question, model)
         except Exception as e:
             answer = f"[ERROR] {e}"
 
@@ -123,7 +123,9 @@ def run_eval(frames: list[bytes], model: str):
             correct += 1
 
         print(f"         → {'PASS' if passed else 'FAIL'}")
-        print(f"         {answer[:120]}...")
+        print(f"         VLM: {answer[:120]}...")
+        if not passed:
+            print(f"         Why: {q.get('why_vlm_fails', '')}")
         print()
 
     print("=" * 60)
@@ -137,7 +139,6 @@ def main():
     parser = argparse.ArgumentParser(description="Direct VLM Baseline — no scene graph")
     parser.add_argument("--video", required=True, help="Path to video file")
     parser.add_argument("--question", "-q", action="append", help="Question(s) to ask")
-    parser.add_argument("--frames", type=int, default=8, help="Number of frames to sample (default: 8)")
     parser.add_argument("--model", default="gemini-2.5-flash", help="Gemini model ID")
     parser.add_argument("--eval", action="store_true", help="Run the evaluation set")
     args = parser.parse_args()
@@ -146,17 +147,17 @@ def main():
         print(f"Error: Video not found: {args.video}")
         sys.exit(1)
 
-    frames = sample_frames(args.video, args.frames)
+    video_part = load_video(args.video)
 
     if args.eval:
-        run_eval(frames, args.model)
+        run_eval(video_part, args.model)
         return
 
     if args.question:
         for q in args.question:
             print(f"\nQ: {q}")
             print("-" * 50)
-            answer = ask_direct(frames, q, args.model)
+            answer = ask_direct(video_part, q, args.model)
             print(answer)
         return
 
@@ -170,7 +171,7 @@ def main():
         if not question or question.lower() in ("quit", "exit", "q"):
             break
         print()
-        answer = ask_direct(frames, question, args.model)
+        answer = ask_direct(video_part, question, args.model)
         print(answer)
         print()
 

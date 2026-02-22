@@ -7,16 +7,17 @@ Processes video into a spatio-temporal scene graph and answers
 Replaces VestaAgent for the scene graph pipeline.
 """
 
+import asyncio
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 
 from vesta.flow.optical_flow import CameraMotion, estimate_camera_motion
 from vesta.detection.gemini_detector import KeyframeSampler
-from vesta.detection.scene_descriptor import describe_scene, SceneAnalysis
+from vesta.detection.scene_descriptor import describe_scene_async, SceneAnalysis
 from vesta.registry.scene_graph import SceneGraph
 
 
@@ -35,11 +36,13 @@ class SceneAgent:
         keyframe_interval: int = 30,
         model: str = "gemini-2.5-flash",
         fov_degrees: float = 90.0,
+        max_workers: int = 10,
         verbose: bool = True,
     ):
         self.video_path = video_path
         self.model = model
         self.verbose = verbose
+        self.max_workers = max_workers
 
         self.graph = SceneGraph(fov_degrees=fov_degrees)
         self.sampler = KeyframeSampler(interval=keyframe_interval)
@@ -73,18 +76,16 @@ class SceneAgent:
             print(f"[VESTA] Processing: {self.video_path}")
             print(f"[VESTA] {total_frames} frames @ {self.fps:.1f} FPS = {total_frames/self.fps:.1f}s")
 
-        # ── Pass 1+2: Optical flow + Gemini (overlapped) ──
+        # ── Pass 1: Optical flow (read all frames, compute motion) ──
         t_start = time.time()
         if self.verbose:
-            print(f"[VESTA] Pass 1+2: Optical flow + Gemini (overlapped)...")
+            print(f"[VESTA] Pass 1: Optical flow...")
 
         all_frames = []
         motions = []
         keyframe_indices = []
         keyframe_headings = []
-
-        executor = ThreadPoolExecutor(max_workers=4)
-        gemini_futures = {}
+        keyframe_frames = {}  # frame_idx → frame copy
 
         prev_frame = None
         frame_idx = 0
@@ -109,10 +110,9 @@ class SceneAgent:
             if self.sampler.should_sample(frame_idx, motion):
                 keyframe_indices.append(frame_idx)
                 keyframe_headings.append(cumulative_heading)
-                future = executor.submit(describe_scene, frame.copy(), self.model)
-                gemini_futures[future] = frame_idx
+                keyframe_frames[frame_idx] = frame.copy()
                 if self.verbose:
-                    print(f"[VESTA] Keyframe #{len(keyframe_indices)} @ frame {frame_idx} → submitted")
+                    print(f"[VESTA] Keyframe #{len(keyframe_indices)} @ frame {frame_idx}")
 
             prev_frame = frame
             frame_idx += 1
@@ -122,21 +122,16 @@ class SceneAgent:
 
         t_flow_done = time.time() - t_start
         if self.verbose:
-            print(f"[VESTA] Flow done: {frame_idx} frames in {t_flow_done:.1f}s, "
-                  f"{len(keyframe_indices)} keyframes submitted")
+            print(f"[VESTA] Pass 1 done: {frame_idx} frames in {t_flow_done:.1f}s, "
+                  f"{len(keyframe_indices)} keyframes found")
 
-        # Collect Gemini results
-        scene_results = {}
-        for future in as_completed(gemini_futures):
-            fidx = gemini_futures[future]
-            try:
-                scene_results[fidx] = future.result()
-            except Exception as e:
-                if self.verbose:
-                    print(f"[VESTA] Gemini error for frame {fidx}: {e}")
-                scene_results[fidx] = SceneAnalysis()
+        # ── Pass 2: Async Gemini calls (all keyframes at once) ──
+        if self.verbose:
+            print(f"[VESTA] Pass 2: Sending {len(keyframe_indices)} keyframes to Gemini "
+                  f"(max {self.max_workers} concurrent)...")
 
-        executor.shutdown(wait=False)
+        scene_results = self._run_gemini_async(keyframe_frames)
+
         t_pass12 = time.time() - t_start
         if self.verbose:
             print(f"[VESTA] Pass 1+2 done: {len(scene_results)} responses in {t_pass12:.1f}s")
@@ -255,6 +250,51 @@ class SceneAgent:
                 print(f"[VESTA] Video saved: {output_video}")
 
         return summary
+
+    def _run_gemini_async(self, keyframe_frames: dict[int, any]) -> dict[int, SceneAnalysis]:
+        """
+        Run all Gemini keyframe calls concurrently using async I/O.
+
+        Uses asyncio + semaphore for controlled concurrency — much faster than
+        ThreadPoolExecutor because we're I/O bound (waiting for HTTP responses).
+        """
+        async def _process_all():
+            sem = asyncio.Semaphore(self.max_workers)
+            results = {}
+
+            async def _process_one(fidx, frame):
+                async with sem:
+                    try:
+                        result = await describe_scene_async(frame, self.model)
+                        if self.verbose and result.entities:
+                            print(f"[VESTA] ✓ Frame {fidx}: {len(result.entities)} entities")
+                        elif self.verbose:
+                            print(f"[VESTA] ✗ Frame {fidx}: parse failed, 0 entities")
+                        return fidx, result
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"[VESTA] ✗ Frame {fidx}: {e}")
+                        return fidx, SceneAnalysis()
+
+            tasks = [_process_one(fidx, frame) for fidx, frame in keyframe_frames.items()]
+            completed = await asyncio.gather(*tasks)
+
+            for fidx, result in completed:
+                results[fidx] = result
+            return results
+
+        # Run the async event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Already in an async context (e.g., Jupyter) — use thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                    return pool.submit(lambda: asyncio.run(_process_all())).result()
+            else:
+                return loop.run_until_complete(_process_all())
+        except RuntimeError:
+            return asyncio.run(_process_all())
 
     # ── Tool Functions ───────────────────────────────────────────────────
 
@@ -383,401 +423,424 @@ class SceneAgent:
         else:
             return json.dumps(self.graph.get_progress_summary())
 
-    # ── Query Classifier ──────────────────────────────────────────────────
+    # ── Tool Declarations for Gemini Function Calling ───────────────────
 
-    @staticmethod
-    def _classify_query(question: str) -> str | None:
-        """
-        Rule-based query classifier. Returns a tool hint or None for ambiguous.
-
-        Forces the right tool for obvious query patterns, preventing Gemini
-        from picking the wrong tool for spatial/temporal/change questions.
-        """
-        q = question.lower().strip()
-
-        # Spatial + temporal combined: "what's behind me at 30 seconds?"
-        import re
-        spatial_keywords = [
-            "behind", "left", "right", "front", "ahead", "rear",
-            "front-left", "front-right", "behind-left", "behind-right",
-        ]
-        has_time = re.search(r"at\s+\d+\s*s(?:econds?)?|at\s+\d+\s*min(?:ute)?", q)
-        if has_time:
-            for kw in spatial_keywords:
-                if kw in q:
-                    return "direction_at_time"
-
-        # Spatial direction queries (no time component)
-        for kw in spatial_keywords:
-            if f"what's {kw}" in q or f"whats {kw}" in q or f"what is {kw}" in q or f"to my {kw}" in q:
-                return "direction"
-
-        # Spatial relation queries (two entities)
-        if "relative to" in q or "compared to" in q:
-            return "spatial_relation"
-        if ("where is" in q or "position of" in q) and ("relative" in q or "from" in q):
-            return "spatial_relation"
-
-        # Temporal queries
-        import re
-        if re.search(r"at \d+ ?s(econds?)?", q) or "at the start" in q or "at the end" in q:
-            return "temporal"
-        if "when was" in q or "when did" in q or "what time" in q or "at what time" in q:
-            return "temporal"
-        if "how long" in q or "how much time" in q or "duration" in q:
-            return "temporal"
-
-        # Change/progress queries
-        change_keywords = [
-            "changed", "change", "different", "progress", "evolved",
-            "before and after", "state change", "what happened to",
-        ]
-        for kw in change_keywords:
-            if kw in q:
-                return "changes"
-
-        return None
-
-    def _force_tool_call(self, question: str, hint: str) -> str:
-        """Execute the forced tool call based on query classification."""
-        import re
-        q = question.lower()
-
-        if hint == "direction_at_time":
-            # Extract direction and time
-            direction = None
-            for d in ["behind", "rear", "back", "front", "ahead", "forward",
-                       "left", "right", "front-left", "front-right",
-                       "behind-left", "behind-right"]:
-                if d in q:
-                    direction = d
-                    break
-            time_match = re.search(r"at\s+(\d+)\s*s(?:econds?)?", q)
-            if not time_match:
-                time_match = re.search(r"at\s+(\d+)\s*min", q)
-                if time_match:
-                    t = float(time_match.group(1)) * 60
-                else:
-                    return None
-            else:
-                t = float(time_match.group(1))
-            if direction:
-                result_json = self.tool_get_direction_at_time(direction, t)
-                result = json.loads(result_json)
-                return self._synthesize_answer(question, "get_direction_at_time", result)
-            return None
-
-        if hint == "direction":
-            # Extract the direction keyword
-            for d in ["behind", "rear", "back", "front", "ahead", "forward",
-                       "left", "right", "front-left", "front-right",
-                       "behind-left", "behind-right"]:
-                if d in q:
-                    result_json = self.tool_get_entities_in_direction(d)
-                    result = json.loads(result_json)
-                    break
-            else:
-                return None
-            # Still use Gemini to synthesize the answer from the tool result
-            return self._synthesize_answer(question, "get_entities_in_direction", result)
-
-        elif hint == "changes":
-            # Check if a specific entity is mentioned
-            entity_label = ""
-            for entity in self.graph.get_all():
-                if entity.label.lower() in q:
-                    entity_label = entity.label
-                    break
-            result_json = self.tool_get_changes(entity_label)
-            result = json.loads(result_json)
-            return self._synthesize_answer(question, "get_changes", result)
-
-        elif hint == "temporal":
-            import re
-            # If asking about a specific time, use get_entities_at_time
-            match = re.search(r"(\d+)\s*s(?:econds?)?", q)
-            if match:
-                t = float(match.group(1))
-                result_json = self.tool_get_entities_at_time(t)
-                result = json.loads(result_json)
-                return self._synthesize_answer(question, "get_entities_at_time", result)
-
-            # If asking "at what time..." or "when..." or "how long...",
-            # find the entity mentioned and get its timeline
-            for entity in self.graph.get_all():
-                if entity.label.lower() in q or entity.category.lower() in q:
-                    result_json = self.tool_get_entity_timeline(entity.label)
-                    result = json.loads(result_json)
-                    return self._synthesize_answer(question, "get_entity_timeline", result)
-
-            # Fallback: try worker_1 or camera_self for self-referential questions
-            self_words = ["i ", "me ", "my ", "self", "idle", "working", "doing"]
-            if any(w in q for w in self_words):
-                for label in ["camera_self", "worker_1"]:
-                    entities = self.graph.query_by_label(label)
-                    if entities:
-                        result_json = self.tool_get_entity_timeline(entities[0].label)
-                        result = json.loads(result_json)
-                        return self._synthesize_answer(question, "get_entity_timeline", result)
-
-        return None
-
-    def _synthesize_answer(self, question: str, tool_name: str, tool_result: dict) -> str:
-        """Use Gemini to synthesize a natural language answer from tool output."""
-        import google.genai as genai
+    def _get_tool_declarations(self):
+        """Return Gemini function declarations for all scene graph tools."""
         from google.genai import types
 
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-
-        prompt = (
-            f"You are VESTA, a video understanding agent. ALWAYS answer — never refuse.\n\n"
-            f"Question: {question}\n\n"
-            f"Tool used: {tool_name}\n"
-            f"Tool result: {json.dumps(tool_result, indent=2)}\n\n"
-            f"Give a concise, precise answer based on the tool result. "
-            f"For spatial queries, state directions and angles. "
-            f"If the result is empty or incomplete, give your best answer and note the limitation. "
-            f"NEVER say 'I cannot answer this'."
-        )
-
-        response = client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.3),
-        )
-
-        if response.candidates and response.candidates[0].content.parts:
-            return response.candidates[0].content.parts[0].text
-        return "[VESTA] Unable to generate response."
-
-    # ── Natural Language Q&A ─────────────────────────────────────────────
-
-    def ask(self, question: str) -> str:
-        """
-        Ask a natural language question about the scene.
-
-        First checks if a rule-based classifier can route the query directly
-        to the right tool. Falls back to Gemini tool-calling for ambiguous queries.
-        """
-        # Try rule-based routing first for reliable spatial/temporal/change queries
-        hint = self._classify_query(question)
-        if hint:
-            forced = self._force_tool_call(question, hint)
-            if forced:
-                return forced
-
-        # Fall back to full Gemini tool-calling for ambiguous queries
-        return self._ask_with_tools(question)
-
-    def _ask_with_tools(self, question: str) -> str:
-        """Full Gemini tool-calling loop for complex/ambiguous queries."""
-        import google.genai as genai
-        from google.genai import types
-
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-
-        tools = [
-            types.Tool(function_declarations=[
-                types.FunctionDeclaration(
-                    name="get_entities_in_direction",
-                    description="Get all entities in a named direction relative to the camera: front, behind, left, right, front-left, front-right, behind-left, behind-right. Optionally filter by category.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "direction": types.Schema(type="STRING", description="Direction name"),
-                            "category": types.Schema(type="STRING", description="Optional category filter: person, equipment, structure, material, vehicle"),
-                        },
-                        required=["direction"],
-                    ),
+        return [
+            types.FunctionDeclaration(
+                name="get_entities_in_direction",
+                description="Get all tracked entities in a compass direction relative to the camera's current heading. Use for 'what's behind/left/right/in front of me?' questions.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "direction": types.Schema(type="STRING", description="Direction: front, behind, left, right, front-left, front-right, behind-left, behind-right"),
+                        "category": types.Schema(type="STRING", description="Optional filter: person, equipment, structure, material, vehicle"),
+                    },
+                    required=["direction"],
                 ),
-                types.FunctionDeclaration(
-                    name="get_entity_info",
-                    description="Get detailed info about a specific entity including its position, timeline of observations, and relationships. Use for questions like 'tell me about the crane' or 'describe the worker'.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "label": types.Schema(type="STRING", description="Entity label to look up (e.g., 'worker_1', 'crane', 'scaffolding')"),
-                        },
-                        required=["label"],
-                    ),
-                ),
-                types.FunctionDeclaration(
-                    name="get_all_entities",
-                    description="Get a complete summary of the scene graph: all entities, their categories, and scene descriptions.",
-                    parameters=types.Schema(type="OBJECT", properties={}),
-                ),
-                types.FunctionDeclaration(
-                    name="get_entities_at_time",
-                    description="Get entities visible at a specific timestamp. Use for questions like 'what was visible at 10 seconds' or 'what was happening at the start'.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "time_seconds": types.Schema(type="NUMBER", description="Timestamp in seconds"),
-                            "window": types.Schema(type="NUMBER", description="Time window in seconds (default 2.0)"),
-                        },
-                        required=["time_seconds"],
-                    ),
-                ),
-                types.FunctionDeclaration(
-                    name="get_spatial_relation",
-                    description="Get the precise spatial relationship between two entities. Returns direction and angular separation. Use for questions like 'where is the crane relative to the worker?' or 'is the scaffolding to the left of the wall?'.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "entity_a": types.Schema(type="STRING", description="Reference entity label"),
-                            "entity_b": types.Schema(type="STRING", description="Target entity label"),
-                        },
-                        required=["entity_a", "entity_b"],
-                    ),
-                ),
-                types.FunctionDeclaration(
-                    name="get_entity_timeline",
-                    description="Get the full observation history of an entity over time. Shows how its state/position changed. Use for questions like 'how did the wall change?' or 'what did the worker do over time?'.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "label": types.Schema(type="STRING", description="Entity label"),
-                        },
-                        required=["label"],
-                    ),
-                ),
-                types.FunctionDeclaration(
-                    name="get_relationships",
-                    description="Get observed spatial and action relationships between entities. Filter by entity name or relation type. Use for questions like 'what is near the crane?' or 'who is operating equipment?'.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "entity_label": types.Schema(type="STRING", description="Filter by entity label"),
-                            "relation_type": types.Schema(type="STRING", description="Filter by relation type: near, left_of, right_of, above, below, operating, standing_on, etc."),
-                        },
-                    ),
-                ),
-                types.FunctionDeclaration(
-                    name="get_changes",
-                    description="Get detected state changes for entities over time. Shows what changed, when, and by how much. Use for progress tracking, change detection, or questions like 'what changed?' or 'how did X evolve?'.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "entity_label": types.Schema(type="STRING", description="Optional entity label to filter changes for"),
-                        },
-                    ),
-                ),
-                types.FunctionDeclaration(
-                    name="get_direction_at_time",
-                    description="Get entities in a direction (front, behind, left, right, etc.) relative to where the camera was facing at a SPECIFIC PAST TIME. Use for questions like 'what was behind me at 30 seconds?' or 'what was to my left at the start?'. This uses the historical heading, not the current heading.",
-                    parameters=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "direction": types.Schema(type="STRING", description="Direction: front, behind, left, right, front-left, front-right, behind-left, behind-right"),
-                            "time_seconds": types.Schema(type="NUMBER", description="Timestamp in seconds"),
-                            "category": types.Schema(type="STRING", description="Optional category filter"),
-                        },
-                        required=["direction", "time_seconds"],
-                    ),
-                ),
-            ])
-        ]
-
-        summary = self.graph.get_summary()
-        cats = ", ".join(f"{v} {k}" for k, v in summary["by_category"].items())
-
-        system_prompt = (
-            f"You are VESTA, a spatio-temporal video understanding agent. You have processed "
-            f"a video ({self.frame_count} frames, {self.frame_count / self.fps:.0f} seconds) and "
-            f"built a scene graph with {summary['total_entities']} tracked entities ({cats}), "
-            f"{summary['total_relationships']} observed relationships, and "
-            f"{summary['total_state_changes']} detected state changes.\n\n"
-            f"The camera is currently facing heading {summary['current_heading']}°.\n"
-            f"Video duration: {self.frame_count / self.fps:.1f} seconds.\n\n"
-            "CRITICAL RULES:\n"
-            "1. NEVER refuse to answer. NEVER say 'I cannot answer this'. ALWAYS try your best.\n"
-            "2. Use tools to look up data, then give your best answer with what you find.\n"
-            "3. If the data is incomplete, still answer and note the uncertainty.\n"
-            "4. The user is wearing the camera (egocentric/first-person video). 'camera_self' = the user.\n"
-            "5. For activity questions ('when was I idle?', 'what was I doing?'), check the camera_self "
-            "or worker timelines — their states describe what was happening.\n\n"
-            "Tool routing:\n"
-            "- SPATIAL (where is X? what's behind me?) → get_entities_in_direction or get_spatial_relation\n"
-            "- TEMPORAL (what at 10s? when was X?) → get_entities_at_time or get_entity_timeline\n"
-            "- PAST SPATIAL (what was behind me at 30s?) → get_direction_at_time\n"
-            "- CHANGES (what changed? how did X evolve?) → get_changes\n"
-            "- ACTIVITY (what was I doing? when was I idle?) → get_entity_timeline for relevant person\n\n"
-            "Be precise and concise. State directions + angles for spatial queries."
-        )
-
-        response = client.models.generate_content(
-            model=self.model,
-            contents=question,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                tools=tools,
-                temperature=0.3,
             ),
-        )
+            types.FunctionDeclaration(
+                name="get_entity_info",
+                description="Get detailed info about a specific entity including its position, timeline, and relationships. Use when asking about a specific object/person.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "label": types.Schema(type="STRING", description="Entity label (e.g. 'worker_1', 'crane_1', 'wall_1')"),
+                    },
+                    required=["label"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_entities_at_time",
+                description="Get all entities visible at a specific timestamp. Use for 'what was visible at Xs?' questions.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "time_seconds": types.Schema(type="NUMBER", description="Timestamp in seconds"),
+                        "window": types.Schema(type="NUMBER", description="Time window in seconds (default 2.0)"),
+                    },
+                    required=["time_seconds"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_spatial_relation",
+                description="Get the spatial relationship between two entities (angle, direction, distance). Use for 'is X left or right of Y?' questions.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "entity_a": types.Schema(type="STRING", description="First entity label"),
+                        "entity_b": types.Schema(type="STRING", description="Second entity label"),
+                    },
+                    required=["entity_a", "entity_b"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_entity_timeline",
+                description="Get the full observation history of an entity over time (timestamps, positions, state changes). Use for 'when did X appear?', 'how long was X visible?', temporal questions.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "label": types.Schema(type="STRING", description="Entity label"),
+                    },
+                    required=["label"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_relationships",
+                description="Get spatial relationships between entities (near, left_of, on_top_of, etc). Use for 'what's near X?', 'what's on top of Y?' questions.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "entity_label": types.Schema(type="STRING", description="Filter by entity label (optional)"),
+                        "relation_type": types.Schema(type="STRING", description="Filter by relation type (optional)"),
+                    },
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_direction_at_time",
+                description="Get entities in a direction relative to where the camera was facing at a SPECIFIC PAST TIME. Use for 'what was behind me at 30s?' questions.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "direction": types.Schema(type="STRING", description="Direction: front, behind, left, right"),
+                        "time_seconds": types.Schema(type="NUMBER", description="Timestamp in seconds"),
+                        "category": types.Schema(type="STRING", description="Optional category filter"),
+                    },
+                    required=["direction", "time_seconds"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="get_changes",
+                description="Get detected state changes for an entity or the whole scene over time. Use for 'what changed?', 'how did X change?', 'idle time' questions.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "entity_label": types.Schema(type="STRING", description="Entity label (optional, empty for all changes)"),
+                    },
+                ),
+            ),
+        ]
 
-        # Tool-calling loop
-        dispatch = {
-            "get_entities_in_direction": self.tool_get_entities_in_direction,
-            "get_entity_info": self.tool_get_entity_info,
-            "get_all_entities": self.tool_get_all_entities,
-            "get_entities_at_time": self.tool_get_entities_at_time,
-            "get_spatial_relation": self.tool_get_spatial_relation,
-            "get_entity_timeline": self.tool_get_entity_timeline,
-            "get_relationships": self.tool_get_relationships,
-            "get_changes": self.tool_get_changes,
-            "get_direction_at_time": self.tool_get_direction_at_time,
+    def _execute_tool_call(self, function_call) -> str:
+        """Execute a tool call and return the result as a string."""
+        name = function_call.name
+        args = dict(function_call.args) if function_call.args else {}
+
+        tool_map = {
+            "get_entities_in_direction": lambda: self.tool_get_entities_in_direction(
+                args.get("direction", "front"), args.get("category", "")),
+            "get_entity_info": lambda: self.tool_get_entity_info(args.get("label", "")),
+            "get_all_entities": lambda: self.tool_get_all_entities(),
+            "get_entities_at_time": lambda: self.tool_get_entities_at_time(
+                args.get("time_seconds", 0), args.get("window", 2.0)),
+            "get_spatial_relation": lambda: self.tool_get_spatial_relation(
+                args.get("entity_a", ""), args.get("entity_b", "")),
+            "get_entity_timeline": lambda: self.tool_get_entity_timeline(args.get("label", "")),
+            "get_relationships": lambda: self.tool_get_relationships(
+                args.get("entity_label", ""), args.get("relation_type", "")),
+            "get_direction_at_time": lambda: self.tool_get_direction_at_time(
+                args.get("direction", "front"), args.get("time_seconds", 0), args.get("category", "")),
+            "get_changes": lambda: self.tool_get_changes(args.get("entity_label", "")),
         }
 
-        max_rounds = 5
-        for _ in range(max_rounds):
-            if not response.candidates or not response.candidates[0].content.parts:
-                break
+        if name in tool_map:
+            return tool_map[name]()
+        return json.dumps({"error": f"Unknown tool: {name}"})
+        return "[VESTA] Unable to generate response."
 
-            tool_calls = [
-                p for p in response.candidates[0].content.parts
-                if p.function_call is not None
-            ]
-            if not tool_calls:
-                break
+    # ── Natural Language Q&A (RAG approach) ──────────────────────────────
 
-            tool_responses = []
-            for tc in tool_calls:
-                fn_name = tc.function_call.name
-                fn_args = dict(tc.function_call.args) if tc.function_call.args else {}
+    def _build_context(self, question: str) -> str:
+        """
+        Build a rich context document from the scene graph, tailored to the question.
 
-                handler = dispatch.get(fn_name)
-                if handler:
-                    result = handler(**fn_args)
-                else:
-                    result = json.dumps({"error": f"Unknown tool: {fn_name}"})
+        This is the RAG retrieval step: we pull ALL relevant data from the scene
+        graph and inject it as context, so Gemini can reason freely over it.
+        """
+        import re
+        q = question.lower()
+        sections = []
+        video_duration = self.frame_count / self.fps
 
-                try:
-                    parsed = json.loads(result)
-                except json.JSONDecodeError:
-                    parsed = {"text": result}
+        # ── Always include: scene overview ──
+        summary = self.graph.get_summary()
+        cats = ", ".join(f"{v} {k}" for k, v in summary["by_category"].items())
+        sections.append(
+            f"## Video Overview\n"
+            f"Duration: {video_duration:.1f}s ({self.frame_count} frames @ {self.fps:.0f} FPS)\n"
+            f"Entities tracked: {summary['total_entities']} ({cats})\n"
+            f"Relationships: {summary['total_relationships']}\n"
+            f"Camera final heading: {summary['current_heading']}°"
+        )
 
-                tool_responses.append(
-                    types.Part.from_function_response(name=fn_name, response=parsed)
+        # ── Scene descriptions (sampled) ──
+        descs = self.graph.scene_descriptions
+        if descs:
+            sampled = descs[::max(1, len(descs) // 6)]  # ~6 evenly spaced
+            lines = [f"## Scene Descriptions (sampled across video)"]
+            for d in sampled:
+                lines.append(f"- T={d['timestamp']:.1f}s: {d['description']}")
+            sections.append("\n".join(lines))
+
+        # ── Entity list with positions ──
+        all_entities = self.graph.get_all(min_confidence=0.15)
+        if all_entities:
+            lines = ["## All Tracked Entities"]
+            for e in all_entities:
+                rel = self.graph.describe_relative_to_camera(e)
+                lines.append(
+                    f"- **{e.label}** [{e.category}]: {e.description} | "
+                    f"angle={e.allo_angle:.1f}° dist={e.distance:.2f} | "
+                    f"seen {e.first_seen:.1f}s–{e.last_seen:.1f}s ({e.times_observed}x) | "
+                    f"state: {e.current_state or 'unknown'} | "
+                    f"confidence: {e.confidence:.2f} | "
+                    f"Position: {rel}"
                 )
+            sections.append("\n".join(lines))
 
+        # ── Detect if question is about a specific time ──
+        time_match = re.search(r"(\d+)\s*s(?:econds?)?", q)
+        if not time_match:
+            time_match = re.search(r"(\d+)\s*min(?:ute)?s?", q)
+            if time_match:
+                query_time = float(time_match.group(1)) * 60
+            else:
+                query_time = None
+        else:
+            query_time = float(time_match.group(1))
+
+        if query_time is not None:
+            # Add entities visible at that time
+            entities_at_t = self.graph.query_time_range(
+                max(0, query_time - 2), query_time + 2
+            )
+            if entities_at_t:
+                lines = [f"## Entities visible around T={query_time:.0f}s"]
+                for e in entities_at_t:
+                    lines.append(f"- {e.label} [{e.category}]: {e.description} (state: {e.current_state})")
+                sections.append("\n".join(lines))
+
+            # Add heading at that time
+            heading = self.graph.heading_at_time(query_time)
+            sections.append(f"## Camera heading at T={query_time:.0f}s: {heading:.1f}°")
+
+            # Add spatial directions at that time
+            for direction in ["front", "behind", "left", "right"]:
+                ents = self.graph.query_direction_at_time(direction, query_time)
+                if ents:
+                    names = ", ".join(f"{e.label} ({e.description[:40]})" for e in ents[:5])
+                    sections.append(f"At T={query_time:.0f}s, {direction}: {names}")
+
+        # ── If question mentions a specific entity, include its full timeline ──
+        mentioned_entities = []
+        for e in all_entities:
+            if e.label.lower() in q or any(
+                word in q for word in e.label.lower().split("_") if len(word) > 3
+            ):
+                mentioned_entities.append(e)
+
+        # Also check for self-referential questions
+        self_words = ["i ", "me ", "my ", "self", "idle", "working", "doing", "person"]
+        if any(w in q for w in self_words):
+            for label in ["camera_self", "worker_1"]:
+                ents = self.graph.query_by_label(label)
+                if ents and ents[0] not in mentioned_entities:
+                    mentioned_entities.append(ents[0])
+
+        for e in mentioned_entities[:3]:  # Limit to 3 entity timelines
+            timeline = self.graph.get_entity_timeline(e.id)
+            if timeline:
+                lines = [f"## Timeline for {e.label} ({e.category})"]
+                lines.append(f"First seen: {e.first_seen:.1f}s, Last seen: {e.last_seen:.1f}s")
+                for obs in timeline:
+                    lines.append(
+                        f"- T={obs['timestamp']:.1f}s: {obs['description']} "
+                        f"(angle={obs['angle']:.1f}°)"
+                    )
+                sections.append("\n".join(lines))
+
+            # Also get relationships for mentioned entities
+            rels = self.graph.query_relationships(entity_label=e.label)
+            if rels:
+                lines = [f"## Relationships for {e.label}"]
+                for r in rels[:10]:
+                    lines.append(f"- {r['subject']} {r['relation']} {r['object']} (T={r['timestamp']:.1f}s)")
+                sections.append("\n".join(lines))
+
+        # ── State changes (if question is about changes/progress) ──
+        change_words = ["change", "different", "progress", "evolve", "before", "after", "idle", "working"]
+        if any(w in q for w in change_words):
+            changes = self.graph.detect_changes()
+            if changes:
+                lines = ["## Detected State Changes"]
+                for c in changes[:15]:
+                    lines.append(
+                        f"- {c.entity_label}: T={c.timestamp_before:.1f}s→{c.timestamp_after:.1f}s | "
+                        f"'{c.state_before[:60]}' → '{c.state_after[:60]}'"
+                    )
+                sections.append("\n".join(lines))
+
+        # ── Spatial relationships (if question is spatial) ──
+        spatial_words = ["where", "left", "right", "behind", "front", "near", "next to", "relative", "direction"]
+        if any(w in q for w in spatial_words):
+            # Include key spatial relations
+            rels = self.graph.query_relationships()
+            if rels:
+                # Deduplicate and take most recent
+                seen = set()
+                unique_rels = []
+                for r in reversed(rels):
+                    key = (r["subject"], r["relation"], r["object"])
+                    if key not in seen:
+                        seen.add(key)
+                        unique_rels.append(r)
+                if unique_rels:
+                    lines = ["## Key Spatial Relationships"]
+                    for r in unique_rels[:15]:
+                        lines.append(f"- {r['subject']} {r['relation']} {r['object']}")
+                    sections.append("\n".join(lines))
+
+        return "\n\n".join(sections)
+
+    def ask(self, question: str, max_rounds: int = 5) -> str:
+        """
+        Agentic RAG: context injection + tool calling in a multi-turn loop.
+
+        1. Build scene graph context (RAG retrieval)
+        2. Attach video if available (visual fallback)
+        3. Provide tools for precise spatial/temporal queries
+        4. Gemini reads context, optionally calls tools, then answers
+        5. Loop up to max_rounds if Gemini needs more tool calls
+        """
+        import google.genai as genai
+        from google.genai import types
+
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+        context = self._build_context(question)
+
+        system_prompt = (
+            f"You are VESTA, a spatio-temporal video understanding agent.\n\n"
+            f"You have THREE sources of information:\n"
+            f"1. SCENE GRAPH — structured data with precise entity positions (angles, directions), "
+            f"temporal timestamps (first_seen, last_seen), object permanence, and state changes. "
+            f"This is your PRIMARY advantage over raw video models.\n"
+            f"2. VIDEO — the original first-person (egocentric) construction site video is attached. "
+            f"Use it when the scene graph lacks a specific entity or event.\n"
+            f"3. TOOLS — you can call scene graph tools for precise spatial/temporal queries "
+            f"(directions, entity timelines, spatial relations, changes). Use them when you need "
+            f"exact data that isn't already in the context.\n\n"
+            f"HOW TO ANSWER:\n"
+            f"- Read the scene graph context FIRST. If it has what you need, answer directly.\n"
+            f"- If you need more precision (exact angle, timeline, spatial relation), call a tool.\n"
+            f"- If the scene graph doesn't have the entity/event at all, use the video.\n"
+            f"- ALWAYS answer. NEVER refuse, say 'can't determine', return -1, or say 'unknown'.\n"
+            f"- For spatial questions, give precise directions (left/right/front/back + angle).\n"
+            f"- For temporal questions, give specific timestamps.\n"
+            f"- Be concise. Match the format the question asks for.\n"
+        )
+
+        # Build initial message: video (optional) + context + question
+        user_parts = []
+
+        # Attach video if available
+        if self.video_path and os.path.exists(self.video_path):
+            video_bytes = open(self.video_path, "rb").read()
+            video_size = len(video_bytes)
+            if video_size <= 20 * 1024 * 1024:  # 20MB inline limit
+                user_parts.append(
+                    types.Part(inline_data=types.Blob(
+                        data=video_bytes, mime_type="video/mp4"
+                    ))
+                )
+            else:
+                try:
+                    uploaded = client.files.upload(
+                        file=self.video_path,
+                        config=types.UploadFileConfig(mime_type="video/mp4"),
+                    )
+                    import time as _time
+                    while uploaded.state == "PROCESSING":
+                        _time.sleep(2)
+                        uploaded = client.files.get(name=uploaded.name)
+                    if uploaded.state != "FAILED":
+                        user_parts.append(
+                            types.Part.from_uri(file_uri=uploaded.uri, mime_type="video/mp4")
+                        )
+                except Exception:
+                    pass  # Skip video if upload fails
+
+        user_parts.append(types.Part(text=(
+            f"--- SCENE GRAPH CONTEXT ---\n\n"
+            f"{context}\n\n"
+            f"--- END CONTEXT ---\n\n"
+            f"Question: {question}"
+        )))
+
+        # Set up conversation history
+        history = [
+            types.Content(role="user", parts=user_parts),
+        ]
+
+        # Tool declarations
+        tool_declarations = self._get_tool_declarations()
+
+        # Agentic loop
+        for round_num in range(max_rounds):
             response = client.models.generate_content(
                 model=self.model,
-                contents=[
-                    types.Content(role="user", parts=[types.Part.from_text(text=question)]),
-                    response.candidates[0].content,
-                    types.Content(role="user", parts=tool_responses),
-                ],
+                contents=history,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    tools=tools,
                     temperature=0.3,
+                    tools=[types.Tool(function_declarations=tool_declarations)],
+                    system_instruction=system_prompt,
                 ),
             )
 
-        if response.candidates and response.candidates[0].content.parts:
-            text_parts = [
-                p.text for p in response.candidates[0].content.parts if p.text
-            ]
-            return "\n".join(text_parts)
+            if not response.candidates:
+                return "[VESTA] No response generated."
 
-        return "[VESTA] Unable to generate response."
+            candidate = response.candidates[0]
+
+            # Check if the model wants to call tools
+            has_function_calls = False
+            function_call_parts = []
+            text_parts = []
+
+            for part in candidate.content.parts:
+                if part.function_call:
+                    has_function_calls = True
+                    function_call_parts.append(part)
+                elif part.text:
+                    text_parts.append(part.text)
+
+            if not has_function_calls:
+                # Model gave a final text answer — we're done
+                return "\n".join(text_parts) if text_parts else "[VESTA] No response."
+
+            # Execute tool calls and build response
+            history.append(candidate.content)  # Add model's tool call to history
+
+            tool_response_parts = []
+            for part in function_call_parts:
+                fc = part.function_call
+                if self.verbose:
+                    print(f"  [VESTA] Tool call: {fc.name}({dict(fc.args) if fc.args else {}})")
+
+                result_str = self._execute_tool_call(fc)
+
+                tool_response_parts.append(types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fc.name,
+                        response=json.loads(result_str),
+                    )
+                ))
+
+            # Add tool results to history
+            history.append(types.Content(role="user", parts=tool_response_parts))
+
+        # If we exhausted rounds, return whatever text we have
+        return "\n".join(text_parts) if text_parts else "[VESTA] Max tool-calling rounds reached."
