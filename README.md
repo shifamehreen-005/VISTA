@@ -10,7 +10,7 @@ A single monocular hardhat camera. No GPS, no SLAM, no depth sensors. Just optic
 
 ## Demo
 
-<video src="data/VISTADemo.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/684c97a0-7411-47f2-9277-a324c09ce9f0
 
 ---
 
