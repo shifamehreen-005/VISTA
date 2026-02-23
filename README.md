@@ -8,6 +8,12 @@ A single monocular hardhat camera. No GPS, no SLAM, no depth sensors. Just optic
 
 ---
 
+## Demo
+
+<video src="data/VISTADemo.mp4" controls width="100%"></video>
+
+---
+
 ## The Problem
 
 Construction sites generate hours of first-person video from hardhat-mounted cameras every day. Supervisors reviewing this footage face a fundamental limitation: **the footage remembers everything, but the AI remembers nothing.**
