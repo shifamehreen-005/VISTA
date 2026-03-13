@@ -1,0 +1,51 @@
+{
+  "description": "Molmo2 benchmark config for VISTA comparisons",
+  "notes": "Use the same prompts with your VISTA pipeline for fair side-by-side comparison.",
+  "test_cases": [
+    {
+      "id": "test_07_front_5s",
+      "video": "test_7.mp4",
+      "prompt": "What is directly in front of me at the 5-second mark? Answer in one phrase."
+    },
+    {
+      "id": "test_07_direction_to_brick",
+      "video": "test_7.mp4",
+      "prompt": "Which direction should I walk to reach the brick - left, right, straight, or back? Answer with one word."
+    },
+    {
+      "id": "test_05_diag_cutters_first_use",
+      "video": "test_5.mp4",
+      "prompt": "At what timestamp does the person first use diagonal cutters? Answer with just the time in seconds."
+    },
+    {
+      "id": "test_09_bathtub_first_appear",
+      "video": "test_9.mp4",
+      "prompt": "At what timestamp does the bathtub first appear in the video? Answer with just the time in seconds."
+    },
+    {
+      "id": "test_06_staircase_relative_end",
+      "video": "test_6.mp4",
+      "prompt": "At the end of the video, where is the staircase relative to me - right, left, front, back, or can't determine? Answer with one word."
+    },
+    {
+      "id": "test_02_concrete_walls_30s",
+      "video": "test_2.mp4",
+      "prompt": "At 30 seconds, where are the concrete walls relative to me - right, left, front, back, or can't determine? Answer with one word."
+    },
+    {
+      "id": "test_10_ladder_relative_10s",
+      "video": "test_10.mp4",
+      "prompt": "At the 10-second mark, where is the ladder relative to the worker - right, left, front, or behind? Answer with one word."
+    },
+    {
+      "id": "test_03_idle_seconds",
+      "video": "test_3.mp4",
+      "prompt": "How many seconds is the person idle (not doing construction work) in this video? Answer with just the number of seconds."
+    },
+    {
+      "id": "test_11_bucket_start_end",
+      "video": "test_11.mp4",
+      "prompt": "Where is the bucket at the start of the video vs the end? Answer in the format: start=DIRECTION, end=DIRECTION."
+    }
+  ]
+}
